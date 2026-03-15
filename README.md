@@ -30,6 +30,12 @@ git status
 git remote -v
 ```
 
+如果你刚初始化仓库，可用一键脚本绑定远程并推送：
+
+```bash
+./scripts/bootstrap_github_remote.sh <github_repo_url>
+```
+
 ## 2) 手工执行一次同步
 
 ```bash
@@ -71,4 +77,7 @@ source .env && make sync
 
 # 只拉取，不提交推送
 source .env && make sync-no-git
+
+# 绑定远程并推送 main
+./scripts/bootstrap_github_remote.sh <github_repo_url>
 ```
