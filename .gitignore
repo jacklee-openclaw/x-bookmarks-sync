@@ -1,2 +1,4 @@
 .env
 .pycache/
+x-bookmarks/_state/index.sqlite
+x-bookmarks/_raw/
