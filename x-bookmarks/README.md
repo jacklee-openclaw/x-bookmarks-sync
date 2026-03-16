@@ -4,10 +4,9 @@
 
 ## 分类统计
 
-- `ai`: 1
-- `tools`: 1
+- `tools`: 2
 
 ## 最新条目
 
-- [JavaScript is not available. We’ve detected that JavaScript is disabled ](ai/2026-03-17/JavaScript is not available. We’ve detected that JavaScript is disabled.md) | `ai` | 刹车皮 (@shachepi) | March 12, 2026
+- [Claude Code 命令大全](tools/2026-03-17/Claude Code 命令大全.md) | `tools` | 刹车皮 (@shachepi) | Thu Mar 12 10:10:00 +0000 2026
 - [英语口语好，必须学会用英文思维，学会英文思维必须大量阅读，大量看和听英文电影、连续剧、新闻、博客，学习欧美文化，否则你的所谓口语永远停留在打招呼](tools/2026-03-17/英语口语好，必须学会用英文思维，学会英文思维必须大量阅读，大量看和听英文电影、连续剧、新闻、博客，学习欧美文化，否则你的所谓口语永远停留在打招呼.md) | `tools` | Shijie诗姐 (@shijie808) | March 15, 2026
