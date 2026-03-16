@@ -4,9 +4,10 @@
 
 ## 分类统计
 
-- `tools`: 2
+- `ai`: 1
+- `tools`: 1
 
 ## 最新条目
 
-- [https://t.co/fWc2ZDjrzB](tools/2026-03-17/https-t.co-fWc2ZDjrzB-2032036375894413458.md) | `tools` | 刹车皮 (@shachepi) | March 12, 2026
+- [JavaScript is not available. We’ve detected that JavaScript is disabled ](ai/2026-03-17/JavaScript is not available. We’ve detected that JavaScript is disabled.md) | `ai` | 刹车皮 (@shachepi) | March 12, 2026
 - [英语口语好，必须学会用英文思维，学会英文思维必须大量阅读，大量看和听英文电影、连续剧、新闻、博客，学习欧美文化，否则你的所谓口语永远停留在打招呼](tools/2026-03-17/英语口语好，必须学会用英文思维，学会英文思维必须大量阅读，大量看和听英文电影、连续剧、新闻、博客，学习欧美文化，否则你的所谓口语永远停留在打招呼.md) | `tools` | Shijie诗姐 (@shijie808) | March 15, 2026
