@@ -717,8 +717,12 @@ def quality_score(text: str, source_mode: str, min_len: int, marker_count: int =
         score -= 45
     if len(text.strip()) < 280:
         score -= 15
-    if marker_count > 0:
+    # Single weak marker (for example one "sign up" token in unrelated page text)
+    # should not dominate the gate; concentrated marker hits are penalized hard.
+    if marker_count >= 3:
         score -= min(40, 18 + marker_count * 4)
+    elif marker_count > 0:
+        score -= min(8, marker_count * 2)
     if source_mode == "oembed":
         score -= 10
     if source_mode == "browser-playwright":
@@ -1335,10 +1339,10 @@ def process_one_task(
     image_alts = [str(x).strip() for x in meta.get("image_alts", []) if str(x).strip()]
     source_mode = str(meta.get("source_mode", "unknown")).strip() or "unknown"
 
+    # Keep tweet body as canonical source-of-truth.
+    # Linked page fetch is auxiliary context only and must not overwrite original tweet text.
     content_text = text
     linked = fetch_linked_page_text(cfg, text)
-    if linked.get("text") and not looks_incomplete(linked.get("text", ""), cfg.content_min_len):
-        content_text = linked["text"]
 
     browser = {}
     browser_media: list[dict[str, Any]] = []
@@ -1360,8 +1364,8 @@ def process_one_task(
 
     title = (
         browser.get("title")
-        or linked.get("title")
         or SPACE_RE.sub(" ", content_text).strip()[:72]
+        or linked.get("title")
         or f"post-{tweet_id}"
     )
     title = sanitize_filename(title)
@@ -1369,7 +1373,7 @@ def process_one_task(
     points = split_key_points(content_text, max_points=3)
     points_block = "\n".join(f"- {p}" for p in points if p.strip()) or "- （待补充）"
 
-    page_html = str(browser.get("html", "")).strip() or str(linked.get("html", "")).strip()
+    page_html = str(browser.get("html", "")).strip()
     meta_raw_payload = meta.get("raw_payload") or {}
     if not page_html:
         page_html = str(((meta_raw_payload.get("oembed") or {}).get("html", ""))).strip()
