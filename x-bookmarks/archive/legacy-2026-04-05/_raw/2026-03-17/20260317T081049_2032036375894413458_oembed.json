@@ -1,0 +1,52 @@
+{
+  "oembed": {
+    "url": "https://twitter.com/shachepi/status/2032036375894413458",
+    "author_name": "刹车皮",
+    "author_url": "https://twitter.com/shachepi",
+    "html": "<blockquote class=\"twitter-tweet\" data-dnt=\"true\"><p lang=\"zxx\" dir=\"ltr\"><a href=\"https://t.co/fWc2ZDjrzB\">https://t.co/fWc2ZDjrzB</a></p>&mdash; 刹车皮 (@shachepi) <a href=\"https://twitter.com/shachepi/status/2032036375894413458?ref_src=twsrc%5Etfw\">March 12, 2026</a></blockquote>\n\n",
+    "width": 550,
+    "height": null,
+    "type": "rich",
+    "cache_age": "3153600000",
+    "provider_name": "Twitter",
+    "provider_url": "https://twitter.com",
+    "version": "1.0"
+  },
+  "syndication": {},
+  "vxtwitter": {
+    "allSameType": true,
+    "article": {
+      "image": "https://pbs.twimg.com/media/HDM86FkbQAIQmfC.jpg",
+      "preview_text": "本文内容基于Claude Code 2.1.74 整理。不同版本、套餐、插件、技能和平台，具体显示可能有少量差异。但是万变不离其宗。\n发过一篇比较简单的，这篇更详细。Codex和Gemini的命令版本请查看文章底部",
+      "title": "Claude Code 命令大全"
+    },
+    "combinedMediaUrl": null,
+    "communityNote": null,
+    "conversationID": "2032036375894413458",
+    "date": "Thu Mar 12 10:10:00 +0000 2026",
+    "date_epoch": 1773310200,
+    "fetched_on": 1773683940,
+    "hasMedia": false,
+    "hashtags": [],
+    "lang": "zxx",
+    "likes": 259,
+    "mediaURLs": [],
+    "media_extended": [],
+    "pollData": null,
+    "possibly_sensitive": false,
+    "qrt": null,
+    "qrtURL": null,
+    "replies": 8,
+    "replyingTo": null,
+    "replyingToID": null,
+    "retweet": null,
+    "retweetURL": null,
+    "retweets": 69,
+    "text": "http://x.com/i/article/2032033628822159361",
+    "tweetID": "2032036375894413458",
+    "tweetURL": "https://twitter.com/shachepi/status/2032036375894413458",
+    "user_name": "刹车皮",
+    "user_profile_image_url": "https://pbs.twimg.com/profile_images/2026008873317089280/yJKnd8Hs_normal.jpg",
+    "user_screen_name": "shachepi"
+  }
+}
