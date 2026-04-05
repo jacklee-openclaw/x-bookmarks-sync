@@ -161,7 +161,8 @@ def load_dotenv_if_exists(path: Path) -> None:
 
 
 def load_config() -> Config:
-    project_root = Path.cwd().resolve()
+    default_root = Path(__file__).resolve().parent
+    project_root = Path(os.environ.get("KB_PROJECT_ROOT", str(default_root))).expanduser().resolve()
     load_dotenv_if_exists(project_root / ".env")
 
     data_root = (project_root / os.environ.get("KB_ROOT", "x-bookmarks")).resolve()

@@ -209,6 +209,11 @@ https://x.com/<user>/status/<id>
 - 仅提供“可被 Telegram/OpenClaw 调用”的入口脚本：
   - `scripts/openclaw_ingest_link.sh`
   - `scripts/openclaw_ingest_x_link.sh`（兼容壳）
+- 脚本支持关键参数：
+  - `--source <label>`
+  - `--no-git`
+  - `--force`
+  - `--dry-run`（仅入队，不执行抓取）
 
 ### 7.2 典型交互链路
 `Telegram 消息 -> 外部 OpenClaw/Broker -> openclaw_ingest_link.sh -> x_links_to_kb.py sync`
@@ -237,6 +242,11 @@ cp .env.example .env
 python3 x_links_to_kb.py -h
 python3 x_links_to_kb.py status
 ```
+
+可选但推荐的桥接环境变量：
+- `KB_PYTHON_BIN`：固定 bridge 脚本使用的 Python 解释器。
+- `KB_PROJECT_ROOT`：固定 CLI 的项目根目录（防止在非仓库目录调用时写错路径）。
+- `KB_INGEST_FORCE_NO_GIT=1`：在 Telegram/bridge 调试期避免自动 git 提交。
 
 ### 8.2 常用命令
 
@@ -277,6 +287,9 @@ scripts/openclaw_ingest_link.sh 'https://x.com/<user>/status/<id>'
 
 # 定时消费队列
 scripts/openclaw_sync.sh
+
+# 桥接最小联调（不依赖 Telegram）
+scripts/test_ingest.sh 'https://x.com/<user>/status/<id>'
 ```
 
 ### 8.4 手工重试失败项
@@ -363,6 +376,11 @@ python3 x_links_to_kb.py list --limit 50
 1. 外部 OpenClaw/Broker 是否在线。
 2. 外部通道是否真的调用到 `scripts/openclaw_ingest_link.sh`。
 3. 本地终端是否出现脚本执行输出。
+4. 查看桥接日志：
+```bash
+tail -n 50 .state/bridge/openclaw-ingest.log
+tail -n 50 .state/bridge/openclaw-sync.log
+```
 
 ### 11.4 `sync` 自动产生 git 提交
 默认 `KB_AUTO_GIT_PUSH=1`。临时关闭：

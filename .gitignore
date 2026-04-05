@@ -16,6 +16,7 @@ analysis_report.md
 .state/retry/*.json
 .state/runs/*.json
 .state/locks/*.lock
+.state/bridge/*.log
 
 # Derived index database
 x-bookmarks/index/bookmarks.sqlite

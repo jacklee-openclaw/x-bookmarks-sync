@@ -93,6 +93,9 @@ cp .env.example .env
 - `KB_AUTO_GIT_PUSH=1`
 - `KB_GIT_REMOTE=origin`
 - `KB_GIT_BRANCH=main`
+- `KB_INGEST_FORCE_NO_GIT=0`（bridge 脚本可强制关闭 git）
+- `KB_PYTHON_BIN`（可选，固定 bridge 使用的 Python）
+- `KB_PROJECT_ROOT`（可选，固定 CLI 项目根目录）
 
 ## 6. 常用命令
 
@@ -165,6 +168,22 @@ python3 x_links_to_kb.py sync \
 - 入站：`scripts/openclaw_ingest_link.sh`
 - 兼容：`scripts/openclaw_ingest_x_link.sh`
 - 定时消费：`scripts/openclaw_sync.sh`
+- 本地桥接测试：`scripts/test_ingest.sh`
+
+桥接排障日志：
+- `/.state/bridge/openclaw-ingest.log`
+- `/.state/bridge/openclaw-sync.log`
+
+快速自检（不依赖 Telegram）：
+```bash
+scripts/test_ingest.sh 'https://x.com/<user>/status/<id>'
+```
+
+`openclaw_ingest_link.sh` 常用参数：
+```bash
+scripts/openclaw_ingest_link.sh --dry-run 'https://x.com/<user>/status/<id>'
+scripts/openclaw_ingest_link.sh --force --no-git 'https://x.com/<user>/status/<id>'
+```
 
 ## 10. 兼容说明
 
