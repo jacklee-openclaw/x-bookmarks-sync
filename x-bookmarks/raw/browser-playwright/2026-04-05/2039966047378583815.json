@@ -1,0 +1,52 @@
+{
+  "oembed": {
+    "url": "https://twitter.com/yanhua1010/status/2039966047378583815",
+    "author_name": "Yanhua",
+    "author_url": "https://twitter.com/yanhua1010",
+    "html": "<blockquote class=\"twitter-tweet\" data-dnt=\"true\"><p lang=\"zxx\" dir=\"ltr\"><a href=\"https://t.co/9bLSQxoY8u\">https://t.co/9bLSQxoY8u</a></p>&mdash; Yanhua (@yanhua1010) <a href=\"https://twitter.com/yanhua1010/status/2039966047378583815?ref_src=twsrc%5Etfw\">April 3, 2026</a></blockquote>\n\n",
+    "width": 550,
+    "height": null,
+    "type": "rich",
+    "cache_age": "3153600000",
+    "provider_name": "Twitter",
+    "provider_url": "https://twitter.com",
+    "version": "1.0"
+  },
+  "syndication": {},
+  "vxtwitter": {
+    "allSameType": true,
+    "article": {
+      "image": "https://pbs.twimg.com/media/HE9psObbAAA2lB2.jpg",
+      "preview_text": "Karpathy 今天发了一条推文，讲他怎么用 LLM 构建和管理个人知识库。\n \n我反复读了几遍。不是因为什么新概念，是因为他做的事和我这几个月在 Obsidian",
+      "title": "用 LLM + Obsidian 构建个人知识库：基于 Karpathy 的“LLM Knowledge Bases”工作流"
+    },
+    "combinedMediaUrl": null,
+    "communityNote": null,
+    "conversationID": "2039966047378583815",
+    "date": "Fri Apr 03 07:19:41 +0000 2026",
+    "date_epoch": 1775200781,
+    "fetched_on": 1775376074,
+    "hasMedia": false,
+    "hashtags": [],
+    "lang": "zxx",
+    "likes": 1541,
+    "mediaURLs": [],
+    "media_extended": [],
+    "pollData": null,
+    "possibly_sensitive": false,
+    "qrt": null,
+    "qrtURL": null,
+    "replies": 42,
+    "replyingTo": null,
+    "replyingToID": null,
+    "retweet": null,
+    "retweetURL": null,
+    "retweets": 361,
+    "text": "http://x.com/i/article/2039957790010327040",
+    "tweetID": "2039966047378583815",
+    "tweetURL": "https://twitter.com/yanhua1010/status/2039966047378583815",
+    "user_name": "Yanhua",
+    "user_profile_image_url": "https://pbs.twimg.com/profile_images/1998302113592713216/jbKruapM_normal.jpg",
+    "user_screen_name": "yanhua1010"
+  }
+}
