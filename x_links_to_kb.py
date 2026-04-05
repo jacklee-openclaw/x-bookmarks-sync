@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""
-Ingest X status links and build a Markdown knowledge base.
+"""x_to_cdns unified CLI.
 
-Pipeline:
-  1) capture links into inbox
-  2) sync pending links -> fetch metadata -> render markdown -> update index
-  3) optional git commit/push
+Goals:
+- Stable data contract (raw / curated / index / meta)
+- Explicit state machine (.state/pending -> processing -> done/error/retry)
+- Single CLI entrypoint for sync/index/search/status/list/path
+- Structured run logs for observability
 """
 
 from __future__ import annotations
@@ -16,6 +16,8 @@ import html
 import json
 import os
 import re
+import shlex
+import shutil
 import sqlite3
 import subprocess
 import textwrap
@@ -27,10 +29,6 @@ from pathlib import Path
 from typing import Any
 
 
-class IngestError(Exception):
-    """Raised when the ingest pipeline cannot continue safely."""
-
-
 STATUS_URL_RE = re.compile(
     r"https?://(?:x\.com|twitter\.com)/([A-Za-z0-9_]+)/status/(\d+)(?:[/?#][^\s]*)?",
     flags=re.IGNORECASE,
@@ -39,21 +37,71 @@ HASHTAG_RE = re.compile(r"#([0-9A-Za-z_\u4e00-\u9fff]+)")
 TAG_SPLIT_RE = re.compile(r"[,\s]+")
 HTML_TAG_RE = re.compile(r"<[^>]+>")
 SPACE_RE = re.compile(r"\s+")
+URL_RE = re.compile(r"https?://\S+", flags=re.IGNORECASE)
+
+QUEUE_STATES = ("pending", "processing", "done", "error", "retry")
+
+
+class CliError(Exception):
+    """Raised when an operation cannot continue safely."""
+
+
+@dataclass
+class CategoryRule:
+    name: str
+    match: list[str]
+    action: str
+    folder: str
+    template: str
+
+
+@dataclass
+class CategoryConfig:
+    version: int
+    default_category: str
+    rules: list[CategoryRule]
 
 
 @dataclass
 class Config:
-    kb_root: Path
-    state_dir: Path
-    raw_dir: Path
-    default_category: str
-    categories: list[str]
+    project_root: Path
+    data_root: Path
+    raw_root: Path
+    curated_root: Path
+    index_root: Path
+    meta_root: Path
+    archive_root: Path
+
+    state_root: Path
+    state_pending: Path
+    state_processing: Path
+    state_done: Path
+    state_error: Path
+    state_retry: Path
+    state_locks: Path
+    state_runs: Path
+
+    categories_cfg_path: Path
+    templates_root: Path
+
     x_access_token: str | None
     x_api_base: str
     request_timeout_sec: int
+    content_min_len: int
+    browser_fallback_enabled: bool
+    browser_fallback_cmd: str | None
+    browser_fallback_timeout_sec: int
+
+    max_retry: int
     auto_git_push: bool
     git_remote: str
     git_branch: str | None
+    git_include_state: bool
+
+
+# ---------------------------------------------------------------------------
+# Common helpers
+# ---------------------------------------------------------------------------
 
 
 def utc_now_iso() -> str:
@@ -74,138 +122,104 @@ def load_dotenv_if_exists(path: Path) -> None:
         os.environ[key] = value.strip().strip('"').strip("'")
 
 
-def parse_categories(raw: str) -> list[str]:
-    items = [x.strip().lower() for x in raw.split(",")]
-    cleaned = [x for x in items if x]
-    if not cleaned:
-        return ["ai", "eda", "verification", "career", "tools", "misc"]
-    # Keep order and remove duplicates.
-    seen: set[str] = set()
-    result: list[str] = []
-    for item in cleaned:
-        if item not in seen:
-            seen.add(item)
-            result.append(item)
-    return result
-
-
 def load_config() -> Config:
-    load_dotenv_if_exists(Path(".env"))
+    project_root = Path.cwd().resolve()
+    load_dotenv_if_exists(project_root / ".env")
 
-    kb_root = Path(os.environ.get("KB_ROOT", "x-bookmarks")).expanduser().resolve()
-    state_dir = kb_root / "_state"
-    raw_dir = kb_root / "_raw"
-    default_category = os.environ.get("KB_DEFAULT_CATEGORY", "tools").strip().lower() or "tools"
-    categories = parse_categories(os.environ.get("KB_CATEGORIES", "ai,eda,verification,career,tools,misc"))
-    if default_category not in categories:
-        categories.append(default_category)
+    data_root = (project_root / os.environ.get("KB_ROOT", "x-bookmarks")).resolve()
+    raw_root = data_root / "raw"
+    curated_root = data_root / "curated"
+    index_root = data_root / "index"
+    meta_root = data_root / "meta"
+    archive_root = data_root / "archive"
+
+    state_root = (project_root / os.environ.get("KB_STATE_ROOT", ".state")).resolve()
+
+    categories_cfg_path = (
+        project_root / os.environ.get("KB_CATEGORIES_CONFIG", "config/categories.json")
+    ).resolve()
+    templates_root = (project_root / os.environ.get("KB_TEMPLATE_DIR", "templates")).resolve()
 
     token = os.environ.get("X_ACCESS_TOKEN", "").strip() or None
     api_base = os.environ.get("X_API_BASE", "https://api.x.com/2").rstrip("/")
     timeout = int(os.environ.get("X_REQUEST_TIMEOUT_SEC", "30"))
-    auto_git_push = os.environ.get("KB_AUTO_GIT_PUSH", "1") == "1"
+    content_min_len = int(os.environ.get("KB_CONTENT_MIN_LEN", "120"))
+    browser_fallback_enabled = os.environ.get("KB_BROWSER_FALLBACK_ENABLED", "1") == "1"
+    browser_fallback_cmd = os.environ.get("KB_BROWSER_FALLBACK_CMD", "").strip() or None
+    browser_fallback_timeout_sec = int(os.environ.get("KB_BROWSER_FALLBACK_TIMEOUT_SEC", "25"))
+
+    max_retry = int(os.environ.get("KB_MAX_RETRY", "2"))
+    auto_git_push = os.environ.get("KB_AUTO_GIT_PUSH", "0") == "1"
     git_remote = os.environ.get("KB_GIT_REMOTE", "origin")
     git_branch = os.environ.get("KB_GIT_BRANCH", "").strip() or None
+    git_include_state = os.environ.get("KB_GIT_INCLUDE_STATE", "0") == "1"
 
     if timeout < 5:
-        raise IngestError("X_REQUEST_TIMEOUT_SEC must be >= 5")
+        raise CliError("X_REQUEST_TIMEOUT_SEC must be >= 5")
 
     return Config(
-        kb_root=kb_root,
-        state_dir=state_dir,
-        raw_dir=raw_dir,
-        default_category=default_category,
-        categories=categories,
+        project_root=project_root,
+        data_root=data_root,
+        raw_root=raw_root,
+        curated_root=curated_root,
+        index_root=index_root,
+        meta_root=meta_root,
+        archive_root=archive_root,
+        state_root=state_root,
+        state_pending=state_root / "pending",
+        state_processing=state_root / "processing",
+        state_done=state_root / "done",
+        state_error=state_root / "error",
+        state_retry=state_root / "retry",
+        state_locks=state_root / "locks",
+        state_runs=state_root / "runs",
+        categories_cfg_path=categories_cfg_path,
+        templates_root=templates_root,
         x_access_token=token,
         x_api_base=api_base,
         request_timeout_sec=timeout,
+        content_min_len=content_min_len,
+        browser_fallback_enabled=browser_fallback_enabled,
+        browser_fallback_cmd=browser_fallback_cmd,
+        browser_fallback_timeout_sec=browser_fallback_timeout_sec,
+        max_retry=max_retry,
         auto_git_push=auto_git_push,
         git_remote=git_remote,
         git_branch=git_branch,
+        git_include_state=git_include_state,
     )
 
 
-def ensure_dirs(cfg: Config) -> None:
-    cfg.kb_root.mkdir(parents=True, exist_ok=True)
-    cfg.state_dir.mkdir(parents=True, exist_ok=True)
-    cfg.raw_dir.mkdir(parents=True, exist_ok=True)
-    for category in cfg.categories:
-        (cfg.kb_root / category).mkdir(parents=True, exist_ok=True)
-
-
-def db_path(cfg: Config) -> Path:
-    return cfg.state_dir / "index.sqlite"
-
-
-def open_db(cfg: Config) -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path(cfg))
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS inbox (
-          url TEXT PRIMARY KEY,
-          status TEXT NOT NULL,
-          raw_text TEXT,
-          tags_json TEXT,
-          note TEXT,
-          source TEXT,
-          error TEXT,
-          created_at TEXT NOT NULL,
-          updated_at TEXT NOT NULL
-        );
-        """
-    )
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS entries (
-          tweet_id TEXT PRIMARY KEY,
-          url TEXT NOT NULL UNIQUE,
-          path TEXT NOT NULL,
-          title TEXT NOT NULL,
-          category TEXT NOT NULL,
-          tags_json TEXT NOT NULL,
-          author_name TEXT,
-          author_username TEXT,
-          post_time TEXT,
-          ingested_at TEXT NOT NULL
-        );
-        """
-    )
-    conn.commit()
-    return conn
-
-
-def extract_status_urls(text: str) -> list[str]:
-    urls: list[str] = []
-    for match in STATUS_URL_RE.finditer(text):
-        username, tweet_id = match.group(1), match.group(2)
-        urls.append(canonical_status_url(username, tweet_id))
-    # Keep stable order and dedupe.
-    seen: set[str] = set()
-    result: list[str] = []
-    for u in urls:
-        if u in seen:
-            continue
-        seen.add(u)
-        result.append(u)
-    return result
-
-
-def canonical_status_url(username: str, tweet_id: str) -> str:
-    return f"https://x.com/{username}/status/{tweet_id}"
+def ensure_layout(cfg: Config) -> None:
+    for p in (
+        cfg.raw_root,
+        cfg.curated_root,
+        cfg.index_root,
+        cfg.meta_root,
+        cfg.archive_root,
+        cfg.state_pending,
+        cfg.state_processing,
+        cfg.state_done,
+        cfg.state_error,
+        cfg.state_retry,
+        cfg.state_locks,
+        cfg.state_runs,
+    ):
+        p.mkdir(parents=True, exist_ok=True)
 
 
 def parse_tags(raw_tags: str | None, text: str) -> list[str]:
     tags: list[str] = []
     if raw_tags:
-        for t in TAG_SPLIT_RE.split(raw_tags.strip()):
-            t = t.strip().lower()
+        for tag in TAG_SPLIT_RE.split(raw_tags.strip()):
+            t = tag.strip().lower()
             if t:
                 tags.append(t)
-    for t in HASHTAG_RE.findall(text):
-        t = t.strip().lower()
+    for tag in HASHTAG_RE.findall(text):
+        t = tag.strip().lower()
         if t:
             tags.append(t)
-    # Dedupe while preserving order.
+
     seen: set[str] = set()
     out: list[str] = []
     for t in tags:
@@ -215,50 +229,202 @@ def parse_tags(raw_tags: str | None, text: str) -> list[str]:
     return out
 
 
-def capture_links(
-    conn: sqlite3.Connection,
-    text: str,
-    raw_tags: str | None,
-    note: str | None,
-    source: str,
-) -> dict[str, Any]:
-    urls = extract_status_urls(text)
-    if not urls:
-        raise IngestError("No valid X status URL found in input text")
+def canonical_status_url(username: str, tweet_id: str) -> str:
+    return f"https://x.com/{username}/status/{tweet_id}"
 
-    tags = parse_tags(raw_tags, text)
-    now = utc_now_iso()
-    inserted = 0
-    updated = 0
-    for url in urls:
-        row = conn.execute("SELECT status FROM inbox WHERE url = ?", (url,)).fetchone()
-        if row is None:
-            conn.execute(
-                """
-                INSERT INTO inbox (url, status, raw_text, tags_json, note, source, created_at, updated_at)
-                VALUES (?, 'pending', ?, ?, ?, ?, ?, ?)
-                """,
-                (url, text, json.dumps(tags, ensure_ascii=False), note, source, now, now),
-            )
-            inserted += 1
-        else:
-            conn.execute(
-                """
-                UPDATE inbox
-                SET status = 'pending',
-                    raw_text = ?,
-                    tags_json = ?,
-                    note = ?,
-                    source = ?,
-                    error = NULL,
-                    updated_at = ?
-                WHERE url = ?
-                """,
-                (text, json.dumps(tags, ensure_ascii=False), note, source, now, url),
-            )
-            updated += 1
-    conn.commit()
-    return {"captured_urls": urls, "inserted": inserted, "updated": updated, "tags": tags}
+
+def extract_status_urls(text: str) -> list[str]:
+    urls: list[str] = []
+    for m in STATUS_URL_RE.finditer(text):
+        urls.append(canonical_status_url(m.group(1), m.group(2)))
+    seen: set[str] = set()
+    out: list[str] = []
+    for u in urls:
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+
+def extract_tweet_id(url: str) -> str:
+    m = STATUS_URL_RE.search(url)
+    if not m:
+        raise CliError(f"Cannot parse tweet id from URL: {url}")
+    return m.group(2)
+
+
+def task_path(cfg: Config, state: str, task_id: str) -> Path:
+    if state not in QUEUE_STATES:
+        raise CliError(f"Unknown queue state: {state}")
+    return getattr(cfg, f"state_{state}") / f"{task_id}.json"
+
+
+def locate_task(cfg: Config, task_id: str) -> tuple[str, Path] | None:
+    for state in QUEUE_STATES:
+        p = task_path(cfg, state, task_id)
+        if p.exists():
+            return state, p
+    return None
+
+
+def read_task(path: Path) -> dict[str, Any]:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def write_task(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def move_task(cfg: Config, payload: dict[str, Any], from_state: str, to_state: str) -> Path:
+    src = task_path(cfg, from_state, payload["task_id"])
+    dst = task_path(cfg, to_state, payload["task_id"])
+    payload["status"] = to_state
+    payload["updated_at"] = utc_now_iso()
+    write_task(src, payload)
+    src.replace(dst)
+    return dst
+
+
+# ---------------------------------------------------------------------------
+# Categories + template
+# ---------------------------------------------------------------------------
+
+
+def default_categories() -> CategoryConfig:
+    return CategoryConfig(
+        version=1,
+        default_category="misc",
+        rules=[
+            CategoryRule("github", ["github.com"], "file", "tools", "bookmark"),
+            CategoryRule("ai", [" ai ", "llm", "gpt", "agent", "anthropic", "openai"], "file", "ai", "bookmark"),
+            CategoryRule("eda", ["eda", "asic", "rtl", "timing", "cadence", "synopsys"], "file", "eda", "bookmark"),
+            CategoryRule("verification", ["verification", "uvm", "formal", "coverage", "assertion", "验证"], "file", "verification", "bookmark"),
+            CategoryRule("career", ["career", "interview", "management", "hiring", "职业", "面试"], "file", "career", "bookmark"),
+            CategoryRule("tools", ["tool", "automation", "script", "workflow", "效率", "自动化", "工具"], "file", "tools", "bookmark"),
+            CategoryRule("default", [], "file", "misc", "bookmark"),
+        ],
+    )
+
+
+def load_categories(cfg: Config) -> CategoryConfig:
+    if not cfg.categories_cfg_path.exists():
+        cfg.categories_cfg_path.parent.mkdir(parents=True, exist_ok=True)
+        d = default_categories()
+        dump = {
+            "version": d.version,
+            "default_category": d.default_category,
+            "rules": [
+                {
+                    "name": r.name,
+                    "match": r.match,
+                    "action": r.action,
+                    "folder": r.folder,
+                    "template": r.template,
+                }
+                for r in d.rules
+            ],
+        }
+        cfg.categories_cfg_path.write_text(
+            json.dumps(dump, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return d
+
+    raw = json.loads(cfg.categories_cfg_path.read_text(encoding="utf-8"))
+    rules = [
+        CategoryRule(
+            name=str(item.get("name", "")).strip() or "default",
+            match=[str(x).lower() for x in item.get("match", []) if str(x).strip()],
+            action=str(item.get("action", "file")).strip() or "file",
+            folder=str(item.get("folder", "misc")).strip() or "misc",
+            template=str(item.get("template", "bookmark")).strip() or "bookmark",
+        )
+        for item in raw.get("rules", [])
+    ]
+    if not rules:
+        return default_categories()
+    return CategoryConfig(
+        version=int(raw.get("version", 1)),
+        default_category=str(raw.get("default_category", "misc")),
+        rules=rules,
+    )
+
+
+def choose_rule(cat_cfg: CategoryConfig, tags: list[str], text: str, url: str) -> CategoryRule:
+    tag_set = {t.lower() for t in tags}
+    corpus = f" {text.lower()} {url.lower()} "
+
+    # explicit tag can route to rule by name/folder first
+    for r in cat_cfg.rules:
+        if r.name.lower() in tag_set or r.folder.lower() in tag_set:
+            return r
+
+    for r in cat_cfg.rules:
+        if not r.match:
+            continue
+        if any(p in corpus for p in r.match):
+            return r
+
+    for r in cat_cfg.rules:
+        if r.name.lower() == "default":
+            return r
+
+    return CategoryRule("default", [], "file", cat_cfg.default_category, "bookmark")
+
+
+def ensure_default_template(cfg: Config) -> None:
+    cfg.templates_root.mkdir(parents=True, exist_ok=True)
+    p = cfg.templates_root / "bookmark.md"
+    if p.exists():
+        return
+    p.write_text(
+        """# {{title}}
+- 作者: {{author}}
+- 时间: {{post_time}}
+- 原始链接: {{url}}
+- 标签: {{tags}}
+- 分类: {{category}}
+- 线程: {{thread_context}}
+- 图片说明: {{image_alts}}
+- 抓取质量: {{quality_score}}
+- 抓取来源: {{source_mode}}
+
+## 核心观点
+{{key_points}}
+
+## 关键原文摘录
+> {{quote_text}}
+
+## 原文全文
+```text
+{{full_text}}
+```
+
+## 我的理解
+- 待补充
+
+## 可执行动作
+- 待补充
+
+## 相关主题
+- {{category}}
+""",
+        encoding="utf-8",
+    )
+
+
+def render_template(path: Path, data: dict[str, str]) -> str:
+    template = path.read_text(encoding="utf-8")
+    out = template
+    for k, v in data.items():
+        out = out.replace(f"{{{{{k}}}}}", v)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Fetch + transform
+# ---------------------------------------------------------------------------
 
 
 def api_get_json(url: str, headers: dict[str, str] | None, timeout: int) -> dict[str, Any]:
@@ -275,18 +441,11 @@ def api_get_json(url: str, headers: dict[str, str] | None, timeout: int) -> dict
             return json.loads(raw.decode("utf-8"))
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
-        raise IngestError(f"HTTP {exc.code} for {url}: {body}") from exc
+        raise CliError(f"HTTP {exc.code} for {url}: {body}") from exc
     except urllib.error.URLError as exc:
-        raise IngestError(f"Network error for {url}: {exc}") from exc
+        raise CliError(f"Network error for {url}: {exc}") from exc
     except json.JSONDecodeError as exc:
-        raise IngestError(f"Invalid JSON response for {url}: {exc}") from exc
-
-
-def extract_tweet_id(url: str) -> str:
-    m = STATUS_URL_RE.search(url)
-    if not m:
-        raise IngestError(f"Cannot extract tweet id from URL: {url}")
-    return m.group(2)
+        raise CliError(f"Invalid JSON from {url}: {exc}") from exc
 
 
 def html_to_text(fragment: str) -> str:
@@ -303,10 +462,8 @@ def fetch_with_oembed(cfg: Config, url: str) -> dict[str, Any]:
     html_block = str(payload.get("html", ""))
     p_match = re.search(r"<p[^>]*>(.*?)</p>", html_block, flags=re.IGNORECASE | re.DOTALL)
     text = html_to_text(p_match.group(1)) if p_match else ""
-    anchor_matches = re.findall(r"<a href=\"([^\"]+)\">([^<]+)</a>", html_block)
-    published_text = ""
-    if anchor_matches:
-        published_text = html.unescape(anchor_matches[-1][1]).strip()
+    anchor_matches = re.findall(r'<a href="([^"]+)">([^<]+)</a>', html_block)
+    published_text = html.unescape(anchor_matches[-1][1]).strip() if anchor_matches else ""
 
     author_name = str(payload.get("author_name", "")).strip()
     author_url = str(payload.get("author_url", "")).strip()
@@ -315,13 +472,61 @@ def fetch_with_oembed(cfg: Config, url: str) -> dict[str, Any]:
     if m:
         author_username = m.group(1)
 
+    try:
+        tweet_id = extract_tweet_id(url)
+        synd = api_get_json(
+            f"https://cdn.syndication.twimg.com/tweet-result?id={tweet_id}&lang=zh-cn",
+            headers=None,
+            timeout=cfg.request_timeout_sec,
+        )
+        synd_text = str(synd.get("text", "")).strip()
+        if synd_text:
+            text = synd_text
+        s_user = synd.get("user") or {}
+        s_name = str(s_user.get("name", "")).strip()
+        s_screen = str(s_user.get("screen_name", "")).strip()
+        if s_name:
+            author_name = s_name
+        if s_screen:
+            author_username = s_screen
+        s_time = str(synd.get("created_at", "")).strip()
+        if s_time:
+            published_text = s_time
+
+        vxt = api_get_json(
+            f"https://api.vxtwitter.com/Twitter/status/{tweet_id}",
+            headers=None,
+            timeout=cfg.request_timeout_sec,
+        )
+        vx_text = str(vxt.get("text", "")).strip()
+        vx_user = str(vxt.get("user_name", "")).strip()
+        vx_screen = str(vxt.get("user_screen_name", "")).strip()
+        vx_date = str(vxt.get("date", "")).strip()
+        article = vxt.get("article") or {}
+        art_preview = str(article.get("preview_text", "")).strip()
+
+        for candidate in [art_preview, vx_text, synd_text, text]:
+            if candidate and not re.fullmatch(r"https?://\S+", candidate):
+                text = candidate
+                break
+        if vx_user:
+            author_name = vx_user
+        if vx_screen:
+            author_username = vx_screen
+        if vx_date:
+            published_text = vx_date
+
+        payload = {"oembed": payload, "syndication": synd, "vxtwitter": vxt}
+    except Exception:
+        pass
+
     return {
         "source_mode": "oembed",
         "text": text,
         "author_name": author_name,
         "author_username": author_username,
         "post_time": published_text,
-        "thread_context": "未抓取（无 API token 模式）",
+        "thread_context": "unknown",
         "image_alts": [],
         "raw_payload": payload,
     }
@@ -329,7 +534,7 @@ def fetch_with_oembed(cfg: Config, url: str) -> dict[str, Any]:
 
 def fetch_with_x_api(cfg: Config, tweet_id: str) -> dict[str, Any]:
     if not cfg.x_access_token:
-        raise IngestError("X_ACCESS_TOKEN is missing")
+        raise CliError("X_ACCESS_TOKEN is missing")
     q = urllib.parse.urlencode(
         {
             "tweet.fields": "created_at,author_id,conversation_id,referenced_tweets,attachments",
@@ -346,75 +551,94 @@ def fetch_with_x_api(cfg: Config, tweet_id: str) -> dict[str, Any]:
     )
     data = payload.get("data") or {}
     if not data:
-        raise IngestError("X API returned empty tweet data")
+        raise CliError("X API returned empty tweet data")
 
     users = {str(u.get("id", "")): u for u in (payload.get("includes") or {}).get("users") or []}
     media_map = {str(m.get("media_key", "")): m for m in (payload.get("includes") or {}).get("media") or []}
 
-    author_id = str(data.get("author_id", "")).strip()
-    author = users.get(author_id) or {}
-    author_name = str(author.get("name", "")).strip()
-    author_username = str(author.get("username", "")).strip()
-    text = str(data.get("text", "")).strip()
-    post_time = str(data.get("created_at", "")).strip()
+    author = users.get(str(data.get("author_id", "")).strip()) or {}
+    image_alts: list[str] = []
+    for media_key in ((data.get("attachments") or {}).get("media_keys") or []):
+        media = media_map.get(str(media_key))
+        if media and str(media.get("alt_text", "")).strip():
+            image_alts.append(str(media.get("alt_text", "")).strip())
 
     conversation_id = str(data.get("conversation_id", "")).strip()
-    thread_context = f"conversation_id={conversation_id}" if conversation_id else "unknown"
-
-    image_alts: list[str] = []
-    media_keys = ((data.get("attachments") or {}).get("media_keys")) or []
-    for key in media_keys:
-        media_obj = media_map.get(str(key))
-        if not media_obj:
-            continue
-        alt = str(media_obj.get("alt_text", "")).strip()
-        if alt:
-            image_alts.append(alt)
-
     return {
         "source_mode": "x_api",
-        "text": text,
-        "author_name": author_name,
-        "author_username": author_username,
-        "post_time": post_time,
-        "thread_context": thread_context,
+        "text": str(data.get("text", "")).strip(),
+        "author_name": str(author.get("name", "")).strip(),
+        "author_username": str(author.get("username", "")).strip(),
+        "post_time": str(data.get("created_at", "")).strip(),
+        "thread_context": f"conversation_id={conversation_id}" if conversation_id else "unknown",
         "image_alts": image_alts,
         "raw_payload": payload,
     }
 
 
-def keyword_category_rules() -> dict[str, list[str]]:
-    return {
-        "ai": ["ai", "llm", "agent", "gpt", "model", "prompt", "大模型", "智能体"],
-        "eda": ["eda", "chip", "asic", "rtl", "timing", "place", "route", "芯片", "后端"],
-        "verification": ["verification", "uvm", "formal", "coverage", "assertion", "验证", "仿真"],
-        "career": ["career", "interview", "leader", "management", "hiring", "职业", "面试"],
-        "tools": ["tool", "automation", "script", "workflow", "效率", "自动化", "工具"],
-    }
+def fetch_linked_page_text(cfg: Config, text: str) -> dict[str, str]:
+    m = URL_RE.search(text or "")
+    if not m:
+        return {}
+    link = m.group(0).rstrip('.,;:!?')
+    try:
+        req = urllib.request.Request(link, method="GET", headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=cfg.request_timeout_sec) as resp:
+            raw = resp.read(600000).decode("utf-8", errors="ignore")
+        tm = re.search(r"<title[^>]*>(.*?)</title>", raw, flags=re.IGNORECASE | re.DOTALL)
+        title = html.unescape(SPACE_RE.sub(" ", tm.group(1))).strip() if tm else ""
+        cleaned = re.sub(r"<script[\s\S]*?</script>", " ", raw, flags=re.IGNORECASE)
+        cleaned = re.sub(r"<style[\s\S]*?</style>", " ", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"<[^>]+>", " ", cleaned)
+        plain = html.unescape(SPACE_RE.sub(" ", cleaned)).strip()
+        return {"title": title[:120], "text": plain[:12000]}
+    except Exception:
+        return {}
 
 
-def infer_category(cfg: Config, tags: list[str], text: str) -> str:
-    lowered_tags = [t.lower() for t in tags]
-    for t in lowered_tags:
-        if t in cfg.categories:
-            return t
+def looks_incomplete(text: str, min_len: int) -> bool:
+    t = (text or "").strip()
+    if len(t) < max(20, min_len):
+        return True
+    markers = [
+        "javascript is not available",
+        "enable javascript",
+        "log in to x",
+        "don’t miss what’s happening",
+        "don't miss what's happening",
+    ]
+    lt = t.lower()
+    if any(m in lt for m in markers):
+        return True
+    return bool(re.fullmatch(r"https?://\S+", t))
 
-    corpus = (text or "").lower()
-    for category, keywords in keyword_category_rules().items():
-        if category not in cfg.categories:
-            continue
-        if any(k in corpus for k in keywords):
-            return category
-    return cfg.default_category
 
-
-def infer_title(text: str, author_name: str, tweet_id: str) -> str:
-    cleaned = SPACE_RE.sub(" ", text).strip()
-    if cleaned:
-        return cleaned[:72]
-    if author_name:
-        return f"{author_name} 的帖子 {tweet_id}"
-    return f"Post {tweet_id}"
+def fetch_with_browser_fallback(cfg: Config, url: str) -> dict[str, str]:
+    if not cfg.browser_fallback_enabled or not cfg.browser_fallback_cmd:
+        return {}
+    try:
+        cmd_text = cfg.browser_fallback_cmd.replace("{url}", shlex.quote(url))
+        proc = subprocess.run(
+            cmd_text,
+            shell=True,
+            text=True,
+            capture_output=True,
+            timeout=cfg.browser_fallback_timeout_sec,
+            check=False,
+        )
+        if proc.returncode != 0:
+            return {}
+        out = (proc.stdout or "").strip()
+        if not out:
+            return {}
+        obj = json.loads(out)
+        return {
+            "title": str(obj.get("title", "")).strip(),
+            "text": str(obj.get("text", "")).strip(),
+            "source": str(obj.get("source", "browser-playwright")).strip() or "browser-playwright",
+        }
+    except Exception:
+        return {}
 
 
 def split_key_points(text: str, max_points: int = 3) -> list[str]:
@@ -428,384 +652,927 @@ def split_key_points(text: str, max_points: int = 3) -> list[str]:
 
 
 def sanitize_filename(name: str) -> str:
-    return re.sub(r"[^A-Za-z0-9._-]+", "_", name)
+    s = re.sub(r"[\\/:*?\"<>|]+", "-", name.strip())
+    s = re.sub(r"\s+", " ", s).strip().strip(".")
+    return (s or "untitled")[:100]
 
 
-def write_raw_payload(cfg: Config, tweet_id: str, payload: dict[str, Any], mode: str) -> Path:
-    day = dt.date.today().isoformat()
-    day_dir = cfg.raw_dir / day
-    day_dir.mkdir(parents=True, exist_ok=True)
-    ts = dt.datetime.now().strftime("%Y%m%dT%H%M%S")
-    fp = day_dir / f"{ts}_{tweet_id}_{mode}.json"
-    fp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    return fp
+def quality_score(text: str, source_mode: str, min_len: int) -> int:
+    score = 100
+    if looks_incomplete(text, min_len):
+        score -= 45
+    if len(text.strip()) < 280:
+        score -= 15
+    if source_mode == "oembed":
+        score -= 10
+    if source_mode == "browser-playwright":
+        score += 5
+    return max(0, min(score, 100))
 
 
-def render_markdown(
-    title: str,
-    url: str,
-    author_name: str,
-    author_username: str,
-    post_time: str,
-    tags: list[str],
-    key_points: list[str],
-    quote_text: str,
-    category: str,
-    thread_context: str,
-    image_alts: list[str],
-) -> str:
-    tag_text = ", ".join(tags) if tags else category
-    image_alt_text = "；".join(image_alts) if image_alts else "（未抓取到）"
-    quote = quote_text.strip() or "（未抓取到）"
-    quote = quote.replace("\n", "\n> ")
-    author_line = author_name or "unknown"
-    if author_username:
-        author_line = f"{author_line} (@{author_username})"
+# ---------------------------------------------------------------------------
+# Storage
+# ---------------------------------------------------------------------------
 
-    points_block = "\n".join(f"- {p}" for p in key_points)
-    return textwrap.dedent(
-        f"""\
-        # {title}
-        - 作者: {author_line}
-        - 时间: {post_time or "unknown"}
-        - 原始链接: {url}
-        - 标签: {tag_text}
-        - 线程: {thread_context}
-        - 图片说明: {image_alt_text}
 
-        ## 核心观点
-        {points_block}
+def db_path(cfg: Config) -> Path:
+    return cfg.index_root / "bookmarks.sqlite"
 
-        ## 关键原文摘录
-        > {quote}
 
-        ## 我的理解
-        - 待补充
-
-        ## 可执行动作
-        - 待补充
-
-        ## 相关主题
-        - {category}
+def open_db(cfg: Config) -> sqlite3.Connection:
+    conn = sqlite3.connect(db_path(cfg))
+    conn.execute(
         """
-    ).rstrip() + "\n"
+        CREATE TABLE IF NOT EXISTS entries (
+          tweet_id TEXT PRIMARY KEY,
+          url TEXT NOT NULL UNIQUE,
+          title TEXT NOT NULL,
+          text TEXT NOT NULL,
+          category TEXT NOT NULL,
+          action TEXT NOT NULL,
+          path TEXT,
+          tags_json TEXT NOT NULL,
+          author_name TEXT,
+          author_username TEXT,
+          post_time TEXT,
+          source_mode TEXT,
+          quality_score INTEGER,
+          ingested_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_entries_category ON entries(category)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_entries_post_time ON entries(post_time)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_entries_ingested_at ON entries(ingested_at)")
+    conn.commit()
+    return conn
 
 
-def build_entry_path(cfg: Config, category: str, tweet_id: str) -> Path:
-    day = dt.date.today().isoformat()
-    directory = cfg.kb_root / category / day
-    directory.mkdir(parents=True, exist_ok=True)
-    return directory / f"{sanitize_filename(tweet_id)}.md"
+def ensure_fts(conn: sqlite3.Connection) -> bool:
+    try:
+        conn.execute(
+            """
+            CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts USING fts5(
+              title,
+              text,
+              author_name,
+              author_username,
+              category,
+              content='entries',
+              content_rowid='rowid'
+            )
+            """
+        )
+        conn.commit()
+        return True
+    except sqlite3.OperationalError:
+        return False
 
 
-def upsert_entry(
-    conn: sqlite3.Connection,
-    tweet_id: str,
-    url: str,
-    path: Path,
-    title: str,
-    category: str,
-    tags: list[str],
-    author_name: str,
-    author_username: str,
-    post_time: str,
-) -> None:
-    now = utc_now_iso()
+def rebuild_fts(conn: sqlite3.Connection) -> bool:
+    if not ensure_fts(conn):
+        return False
+    conn.execute("INSERT INTO entries_fts(entries_fts) VALUES('rebuild')")
+    conn.commit()
+    return True
+
+
+def upsert_entry(conn: sqlite3.Connection, entry: dict[str, Any]) -> None:
     conn.execute(
         """
         INSERT INTO entries (
-          tweet_id, url, path, title, category, tags_json,
-          author_name, author_username, post_time, ingested_at
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          tweet_id, url, title, text, category, action, path, tags_json,
+          author_name, author_username, post_time, source_mode, quality_score, ingested_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(tweet_id) DO UPDATE SET
-          url = excluded.url,
-          path = excluded.path,
-          title = excluded.title,
-          category = excluded.category,
-          tags_json = excluded.tags_json,
-          author_name = excluded.author_name,
-          author_username = excluded.author_username,
-          post_time = excluded.post_time,
-          ingested_at = excluded.ingested_at
+          url=excluded.url,
+          title=excluded.title,
+          text=excluded.text,
+          category=excluded.category,
+          action=excluded.action,
+          path=excluded.path,
+          tags_json=excluded.tags_json,
+          author_name=excluded.author_name,
+          author_username=excluded.author_username,
+          post_time=excluded.post_time,
+          source_mode=excluded.source_mode,
+          quality_score=excluded.quality_score,
+          ingested_at=excluded.ingested_at
         """,
         (
-            tweet_id,
-            url,
-            str(path),
-            title,
-            category,
-            json.dumps(tags, ensure_ascii=False),
-            author_name,
-            author_username,
-            post_time,
-            now,
+            entry["tweet_id"],
+            entry["url"],
+            entry["title"],
+            entry["text"],
+            entry["category"],
+            entry["action"],
+            entry.get("path", ""),
+            json.dumps(entry.get("tags", []), ensure_ascii=False),
+            entry.get("author_name", ""),
+            entry.get("author_username", ""),
+            entry.get("post_time", ""),
+            entry.get("source_mode", ""),
+            int(entry.get("quality_score", 0)),
+            entry["ingested_at"],
         ),
     )
 
 
-def mark_inbox_done(conn: sqlite3.Connection, url: str) -> None:
-    conn.execute(
-        "UPDATE inbox SET status = 'done', error = NULL, updated_at = ? WHERE url = ?",
-        (utc_now_iso(), url),
-    )
+# ---------------------------------------------------------------------------
+# Queue operations
+# ---------------------------------------------------------------------------
 
 
-def mark_inbox_error(conn: sqlite3.Connection, url: str, err: str) -> None:
-    conn.execute(
-        "UPDATE inbox SET status = 'error', error = ?, updated_at = ? WHERE url = ?",
-        (err[:1000], utc_now_iso(), url),
-    )
+def enqueue_links(
+    cfg: Config,
+    text: str,
+    raw_tags: str | None,
+    note: str | None,
+    source: str,
+    force: bool = False,
+) -> dict[str, Any]:
+    urls = extract_status_urls(text)
+    if not urls:
+        raise CliError("No valid X status URL found in input text")
 
+    tags = parse_tags(raw_tags, text)
+    now = utc_now_iso()
 
-def build_kb_readme(cfg: Config, conn: sqlite3.Connection) -> None:
-    rows = conn.execute(
-        """
-        SELECT title, path, category, post_time, author_name, author_username, ingested_at
-        FROM entries
-        ORDER BY ingested_at DESC
-        LIMIT 100
-        """
-    ).fetchall()
-    counts = conn.execute(
-        "SELECT category, COUNT(*) FROM entries GROUP BY category ORDER BY category ASC"
-    ).fetchall()
+    inserted = 0
+    updated = 0
+    skipped_done = 0
 
-    lines: list[str] = []
-    lines.append("# X Links Knowledge Base")
-    lines.append("")
-    lines.append("自动化链路：iPhone 分享 X 链接 -> openclaw 入站 -> Markdown 清洗 -> Git 推送")
-    lines.append("")
-    lines.append("## 分类统计")
-    lines.append("")
-    if counts:
-        for category, count in counts:
-            lines.append(f"- `{category}`: {count}")
-    else:
-        lines.append("- 暂无数据")
-    lines.append("")
-    lines.append("## 最新条目")
-    lines.append("")
-    if rows:
-        for title, path, category, post_time, author_name, author_username, _ in rows:
-            rel = Path(path).resolve().relative_to(cfg.kb_root)
-            author = author_name or "unknown"
-            if author_username:
-                author = f"{author} (@{author_username})"
-            lines.append(
-                f"- [{title}]({rel.as_posix()}) | `{category}` | {author} | {post_time or 'unknown'}"
-            )
-    else:
-        lines.append("- 暂无条目")
-    lines.append("")
-    (cfg.kb_root / "README.md").write_text("\n".join(lines), encoding="utf-8")
+    for url in urls:
+        task_id = extract_tweet_id(url)
+        payload = {
+            "task_id": task_id,
+            "url": url,
+            "raw_text": text,
+            "tags": tags,
+            "note": note or "",
+            "source": source,
+            "status": "pending",
+            "attempts": 0,
+            "last_error": "",
+            "created_at": now,
+            "updated_at": now,
+        }
+        located = locate_task(cfg, task_id)
+        if located is None:
+            write_task(task_path(cfg, "pending", task_id), payload)
+            inserted += 1
+            continue
 
+        state, existing_path = located
+        existing = read_task(existing_path)
+        existing["raw_text"] = text
+        existing["tags"] = tags
+        existing["note"] = note or ""
+        existing["source"] = source
+        existing["updated_at"] = now
 
-def git_cmd(cmd: list[str], cwd: Path) -> tuple[int, str]:
-    proc = subprocess.run(cmd, cwd=str(cwd), text=True, capture_output=True, check=False)
-    out = (proc.stdout or "") + (proc.stderr or "")
-    return proc.returncode, out.strip()
+        if state == "done" and not force:
+            skipped_done += 1
+            write_task(existing_path, existing)
+            continue
 
+        existing["status"] = "pending"
+        existing["last_error"] = ""
+        dst = task_path(cfg, "pending", task_id)
+        write_task(existing_path, existing)
+        if existing_path != dst:
+            existing_path.replace(dst)
+        updated += 1
 
-def maybe_git_push(cfg: Config, touched_root: str, commit_msg: str) -> dict[str, Any]:
-    rc, _ = git_cmd(["git", "rev-parse", "--is-inside-work-tree"], Path.cwd())
-    if rc != 0:
-        return {"status": "skipped", "reason": "not_a_git_repo"}
-
-    rc, _ = git_cmd(["git", "add", touched_root], Path.cwd())
-    if rc != 0:
-        return {"status": "error", "reason": "git_add_failed"}
-
-    rc, diff = git_cmd(["git", "diff", "--cached", "--name-only"], Path.cwd())
-    if rc != 0:
-        return {"status": "error", "reason": "git_diff_failed"}
-    if not diff.strip():
-        return {"status": "skipped", "reason": "no_changes"}
-
-    rc, out = git_cmd(["git", "commit", "-m", commit_msg], Path.cwd())
-    if rc != 0:
-        return {"status": "error", "reason": "git_commit_failed", "detail": out}
-
-    branch = cfg.git_branch
-    if not branch:
-        rc, branch_out = git_cmd(["git", "branch", "--show-current"], Path.cwd())
-        if rc != 0 or not branch_out.strip():
-            return {"status": "error", "reason": "cannot_detect_branch"}
-        branch = branch_out.strip()
-
-    rc, out = git_cmd(["git", "push", cfg.git_remote, branch], Path.cwd())
-    if rc != 0:
-        return {"status": "error", "reason": "git_push_failed", "detail": out}
-    return {"status": "ok", "branch": branch}
-
-
-def process_one_link(cfg: Config, conn: sqlite3.Connection, url: str, tags: list[str]) -> dict[str, Any]:
-    tweet_id = extract_tweet_id(url)
-    metadata: dict[str, Any]
-    if cfg.x_access_token:
-        try:
-            metadata = fetch_with_x_api(cfg, tweet_id)
-        except IngestError:
-            metadata = fetch_with_oembed(cfg, url)
-    else:
-        metadata = fetch_with_oembed(cfg, url)
-
-    text = str(metadata.get("text", "")).strip()
-    author_name = str(metadata.get("author_name", "")).strip()
-    author_username = str(metadata.get("author_username", "")).strip()
-    post_time = str(metadata.get("post_time", "")).strip()
-    thread_context = str(metadata.get("thread_context", "")).strip() or "unknown"
-    image_alts = [str(x).strip() for x in metadata.get("image_alts", []) if str(x).strip()]
-
-    category = infer_category(cfg, tags, text)
-    title = infer_title(text, author_name, tweet_id)
-    points = split_key_points(text, max_points=3)
-
-    md = render_markdown(
-        title=title,
-        url=url,
-        author_name=author_name,
-        author_username=author_username,
-        post_time=post_time,
-        tags=tags,
-        key_points=points,
-        quote_text=text,
-        category=category,
-        thread_context=thread_context,
-        image_alts=image_alts,
-    )
-
-    out_path = build_entry_path(cfg, category, tweet_id)
-    out_path.write_text(md, encoding="utf-8")
-    write_raw_payload(cfg, tweet_id, metadata.get("raw_payload") or {}, metadata.get("source_mode", "unknown"))
-    upsert_entry(
-        conn=conn,
-        tweet_id=tweet_id,
-        url=url,
-        path=out_path,
-        title=title,
-        category=category,
-        tags=tags,
-        author_name=author_name,
-        author_username=author_username,
-        post_time=post_time,
-    )
     return {
-        "tweet_id": tweet_id,
-        "category": category,
-        "path": str(out_path),
-        "source_mode": metadata.get("source_mode", "unknown"),
+        "captured_urls": urls,
+        "inserted": inserted,
+        "updated": updated,
+        "skipped_done": skipped_done,
+        "tags": tags,
     }
 
 
-def cmd_capture(args: argparse.Namespace, cfg: Config, conn: sqlite3.Connection) -> int:
-    result = capture_links(
-        conn=conn,
-        text=args.text,
-        raw_tags=args.tags,
-        note=args.note,
-        source=args.source,
+def collect_tasks(cfg: Config, limit: int, with_retry: bool) -> list[tuple[str, Path]]:
+    items: list[tuple[str, Path]] = []
+    for p in sorted(cfg.state_pending.glob("*.json"), key=lambda x: x.stat().st_mtime):
+        items.append(("pending", p))
+    if with_retry:
+        for p in sorted(cfg.state_retry.glob("*.json"), key=lambda x: x.stat().st_mtime):
+            items.append(("retry", p))
+    return items[: max(0, limit)]
+
+
+def acquire_lock(cfg: Config, name: str) -> Path:
+    lock = cfg.state_locks / f"{name}.lock"
+    if lock.exists():
+        raise CliError(f"Another {name} run appears active: {lock}")
+    lock.write_text(f"pid={os.getpid()}\nstart={utc_now_iso()}\n", encoding="utf-8")
+    return lock
+
+
+def release_lock(lock: Path) -> None:
+    try:
+        if lock.exists():
+            lock.unlink()
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Processing core
+# ---------------------------------------------------------------------------
+
+
+def write_raw_payload(cfg: Config, tweet_id: str, payload: dict[str, Any], source_mode: str) -> Path:
+    day = dt.date.today().isoformat()
+    mode = sanitize_filename(source_mode or "unknown").lower()
+    mode_dir = cfg.raw_root / mode / day
+    mode_dir.mkdir(parents=True, exist_ok=True)
+    fp = mode_dir / f"{tweet_id}.json"
+    fp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return fp
+
+
+def process_one_task(
+    cfg: Config,
+    cat_cfg: CategoryConfig,
+    task: dict[str, Any],
+    conn: sqlite3.Connection,
+) -> dict[str, Any]:
+    url = str(task["url"])
+    tweet_id = extract_tweet_id(url)
+    tags = [str(x).strip().lower() for x in task.get("tags", []) if str(x).strip()]
+
+    if cfg.x_access_token:
+        try:
+            meta = fetch_with_x_api(cfg, tweet_id)
+        except Exception:
+            meta = fetch_with_oembed(cfg, url)
+    else:
+        meta = fetch_with_oembed(cfg, url)
+
+    text = str(meta.get("text", "")).strip()
+    author_name = str(meta.get("author_name", "")).strip()
+    author_username = str(meta.get("author_username", "")).strip()
+    post_time = str(meta.get("post_time", "")).strip()
+    thread_context = str(meta.get("thread_context", "")).strip() or "unknown"
+    image_alts = [str(x).strip() for x in meta.get("image_alts", []) if str(x).strip()]
+    source_mode = str(meta.get("source_mode", "unknown")).strip() or "unknown"
+
+    content_text = text
+    linked = fetch_linked_page_text(cfg, text)
+    if linked.get("text") and not looks_incomplete(linked.get("text", ""), cfg.content_min_len):
+        content_text = linked["text"]
+
+    browser = {}
+    if looks_incomplete(content_text, cfg.content_min_len):
+        browser = fetch_with_browser_fallback(cfg, url)
+        if browser.get("text"):
+            content_text = browser["text"]
+            source_mode = browser.get("source", source_mode)
+
+    rule = choose_rule(cat_cfg, tags, content_text, url)
+    category = rule.folder
+    action = rule.action
+
+    title = (
+        browser.get("title")
+        or linked.get("title")
+        or SPACE_RE.sub(" ", content_text).strip()[:72]
+        or f"post-{tweet_id}"
     )
-    print(json.dumps({"ok": True, "action": "capture", **result}, ensure_ascii=False))
-    return 0
+    title = sanitize_filename(title)
+
+    points = split_key_points(content_text, max_points=3)
+    points_block = "\n".join(f"- {p}" for p in points if p.strip()) or "- （待补充）"
+
+    score = quality_score(content_text, source_mode, cfg.content_min_len)
+
+    ensure_default_template(cfg)
+    template_name = f"{rule.template}.md"
+    template_path = cfg.templates_root / template_name
+    if not template_path.exists():
+        template_path = cfg.templates_root / "bookmark.md"
+
+    full_text = (content_text or "（未抓取到）").strip()
+    quote_text = full_text.replace("\n", "\n> ")
+    author_line = author_name or "unknown"
+    if author_username:
+        author_line = f"{author_line} (@{author_username})"
+
+    doc = render_template(
+        template_path,
+        {
+            "title": title,
+            "author": author_line,
+            "post_time": post_time or "unknown",
+            "url": url,
+            "tags": ", ".join(tags) if tags else category,
+            "category": category,
+            "thread_context": thread_context,
+            "image_alts": "；".join(image_alts) if image_alts else "（未抓取到）",
+            "source_mode": source_mode,
+            "quality_score": str(score),
+            "key_points": points_block,
+            "quote_text": quote_text,
+            "full_text": full_text,
+        },
+    )
+
+    day = dt.date.today().isoformat()
+    written_path = ""
+
+    if action == "file":
+        out_dir = cfg.curated_root / category / day
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / f"{title}.md"
+        if out_path.exists():
+            out_path = out_dir / f"{title}-{tweet_id}.md"
+        out_path.write_text(doc, encoding="utf-8")
+        written_path = str(out_path)
+    else:
+        capture_dir = cfg.meta_root / "captured"
+        capture_dir.mkdir(parents=True, exist_ok=True)
+        cap_file = capture_dir / f"{day}.md"
+        old = cap_file.read_text(encoding="utf-8") if cap_file.exists() else ""
+        block = f"## {title}\n\n{doc}\n\n"
+        cap_file.write_text(old + block, encoding="utf-8")
+        written_path = str(cap_file)
+
+    raw_path = write_raw_payload(cfg, tweet_id, meta.get("raw_payload") or {}, source_mode)
+
+    entry = {
+        "tweet_id": tweet_id,
+        "url": url,
+        "title": title,
+        "text": full_text,
+        "category": category,
+        "action": action,
+        "path": written_path,
+        "tags": tags,
+        "author_name": author_name,
+        "author_username": author_username,
+        "post_time": post_time,
+        "source_mode": source_mode,
+        "quality_score": score,
+        "ingested_at": utc_now_iso(),
+    }
+    upsert_entry(conn, entry)
+
+    return {
+        "task_id": task["task_id"],
+        "tweet_id": tweet_id,
+        "url": url,
+        "category": category,
+        "action": action,
+        "path": written_path,
+        "raw_path": str(raw_path),
+        "source_mode": source_mode,
+        "quality_score": score,
+    }
 
 
-def cmd_sync(args: argparse.Namespace, cfg: Config, conn: sqlite3.Connection) -> int:
-    rows = conn.execute(
-        "SELECT url, tags_json FROM inbox WHERE status = 'pending' ORDER BY created_at ASC LIMIT ?",
-        (args.limit,),
-    ).fetchall()
+def write_run_log(cfg: Config, record: dict[str, Any]) -> Path:
+    run_path = cfg.state_runs / f"{record['run_id']}.json"
+    run_path.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    summary_path = cfg.meta_root / "run-log.jsonl"
+    summary = {
+        "run_id": record["run_id"],
+        "started_at": record["started_at"],
+        "finished_at": record["finished_at"],
+        "ok": record["ok"],
+        "seen": record["pending_seen"],
+        "processed": len(record["processed"]),
+        "errors": len(record["errors"]),
+        "git": record.get("git", {}),
+    }
+    with summary_path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(summary, ensure_ascii=False) + "\n")
+    return run_path
+
+
+def maybe_git_push(cfg: Config, no_git: bool) -> dict[str, Any]:
+    if no_git or not cfg.auto_git_push:
+        return {"status": "skipped", "reason": "disabled"}
+
+    targets = [str(cfg.data_root.relative_to(cfg.project_root))]
+    if cfg.git_include_state:
+        targets.append(str(cfg.state_root.relative_to(cfg.project_root)))
+
+    rc = subprocess.run(["git", "rev-parse", "--is-inside-work-tree"], capture_output=True, text=True)
+    if rc.returncode != 0:
+        return {"status": "skipped", "reason": "not_a_git_repo"}
+
+    add = subprocess.run(["git", "add", *targets], capture_output=True, text=True)
+    if add.returncode != 0:
+        return {"status": "error", "reason": "git_add_failed", "detail": add.stderr.strip()}
+
+    diff = subprocess.run(["git", "diff", "--cached", "--name-only"], capture_output=True, text=True)
+    if diff.returncode != 0:
+        return {"status": "error", "reason": "git_diff_failed"}
+    if not diff.stdout.strip():
+        return {"status": "skipped", "reason": "no_changes"}
+
+    msg = f"feat(sync): ingest bookmarks @ {dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+    commit = subprocess.run(["git", "commit", "-m", msg], capture_output=True, text=True)
+    if commit.returncode != 0:
+        return {"status": "error", "reason": "git_commit_failed", "detail": commit.stderr.strip()}
+
+    branch = cfg.git_branch
+    if not branch:
+        b = subprocess.run(["git", "branch", "--show-current"], capture_output=True, text=True)
+        if b.returncode != 0 or not b.stdout.strip():
+            return {"status": "error", "reason": "cannot_detect_branch"}
+        branch = b.stdout.strip()
+
+    push = subprocess.run(["git", "push", cfg.git_remote, branch], capture_output=True, text=True)
+    if push.returncode != 0:
+        return {"status": "error", "reason": "git_push_failed", "detail": push.stderr.strip()}
+
+    head = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True)
+    return {"status": "ok", "branch": branch, "commit": head.stdout.strip()}
+
+
+def sync_queue(
+    cfg: Config,
+    cat_cfg: CategoryConfig,
+    conn: sqlite3.Connection,
+    limit: int,
+    with_retry: bool,
+    no_git: bool,
+) -> dict[str, Any]:
+    run_id = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    lock = acquire_lock(cfg, "sync")
+
+    started = utc_now_iso()
     processed: list[dict[str, Any]] = []
     errors: list[dict[str, str]] = []
 
-    for url, tags_json in rows:
-        tags: list[str]
-        try:
-            tags = json.loads(tags_json or "[]")
-        except json.JSONDecodeError:
-            tags = []
-        try:
-            result = process_one_link(cfg, conn, url, tags)
-            mark_inbox_done(conn, url)
-            processed.append(result)
-        except Exception as exc:  # Keep sync loop running for the remaining links.
-            mark_inbox_error(conn, url, str(exc))
-            errors.append({"url": url, "error": str(exc)})
-        conn.commit()
+    try:
+        queue_items = collect_tasks(cfg, limit=limit, with_retry=with_retry)
+        for from_state, path in queue_items:
+            task = read_task(path)
+            task["attempts"] = int(task.get("attempts", 0)) + 1
+            task["updated_at"] = utc_now_iso()
+            task["status"] = "processing"
 
-    build_kb_readme(cfg, conn)
-    conn.commit()
+            write_task(path, task)
+            processing_path = task_path(cfg, "processing", task["task_id"])
+            if path != processing_path:
+                path.replace(processing_path)
 
-    git_result = {"status": "skipped", "reason": "disabled"}
-    if cfg.auto_git_push and not args.no_git:
-        commit_msg = f"feat(kb): ingest {len(processed)} links @ {dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-        git_result = maybe_git_push(cfg, cfg.kb_root.name, commit_msg)
+            try:
+                result = process_one_task(cfg, cat_cfg, task, conn)
+                conn.commit()
+                task["last_error"] = ""
+                move_task(cfg, task, "processing", "done")
+                processed.append(result)
+            except Exception as exc:
+                conn.rollback()
+                task["last_error"] = str(exc)
+                target = "retry" if task["attempts"] <= cfg.max_retry else "error"
+                move_task(cfg, task, "processing", target)
+                errors.append({"task_id": task["task_id"], "url": task.get("url", ""), "error": str(exc), "to": target})
 
-    print(
-        json.dumps(
-            {
-                "ok": len(errors) == 0,
-                "action": "sync",
-                "pending_seen": len(rows),
-                "processed": processed,
-                "errors": errors,
-                "git": git_result,
-            },
-            ensure_ascii=False,
-        )
+        fts_enabled = rebuild_fts(conn)
+
+        git_result = maybe_git_push(cfg, no_git=no_git)
+
+        finished = utc_now_iso()
+        result = {
+            "ok": len(errors) == 0,
+            "action": "sync",
+            "run_id": run_id,
+            "started_at": started,
+            "finished_at": finished,
+            "pending_seen": len(queue_items),
+            "processed": processed,
+            "errors": errors,
+            "fts": "enabled" if fts_enabled else "unavailable",
+            "git": git_result,
+        }
+        run_file = write_run_log(cfg, result)
+        result["run_log"] = str(run_file)
+        return result
+    finally:
+        release_lock(lock)
+
+
+# ---------------------------------------------------------------------------
+# Reporting commands
+# ---------------------------------------------------------------------------
+
+
+def cmd_path(cfg: Config, key: str | None) -> dict[str, Any]:
+    mapping = {
+        "project_root": str(cfg.project_root),
+        "data_root": str(cfg.data_root),
+        "raw": str(cfg.raw_root),
+        "curated": str(cfg.curated_root),
+        "index": str(cfg.index_root),
+        "meta": str(cfg.meta_root),
+        "archive": str(cfg.archive_root),
+        "state_root": str(cfg.state_root),
+        "pending": str(cfg.state_pending),
+        "processing": str(cfg.state_processing),
+        "done": str(cfg.state_done),
+        "error": str(cfg.state_error),
+        "retry": str(cfg.state_retry),
+        "locks": str(cfg.state_locks),
+        "runs": str(cfg.state_runs),
+        "categories_config": str(cfg.categories_cfg_path),
+        "templates": str(cfg.templates_root),
+        "sqlite": str(db_path(cfg)),
+    }
+    if key:
+        if key not in mapping:
+            raise CliError(f"Unknown path key: {key}")
+        return {"key": key, "path": mapping[key]}
+    return mapping
+
+
+def count_state_files(cfg: Config) -> dict[str, int]:
+    return {
+        state: len(list(task_path(cfg, state, "*").parent.glob("*.json")))
+        for state in QUEUE_STATES
+    }
+
+
+def cmd_status(cfg: Config, conn: sqlite3.Connection) -> dict[str, Any]:
+    queue_counts = count_state_files(cfg)
+    db_counts = conn.execute("SELECT COUNT(*) FROM entries").fetchone()[0]
+    by_cat_rows = conn.execute(
+        "SELECT category, COUNT(*) c FROM entries GROUP BY category ORDER BY c DESC"
+    ).fetchall()
+    by_cat = {str(k): int(v) for k, v in by_cat_rows}
+
+    latest_run = None
+    run_files = sorted(cfg.state_runs.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if run_files:
+        latest_run = json.loads(run_files[0].read_text(encoding="utf-8"))
+
+    return {
+        "action": "status",
+        "paths": cmd_path(cfg, None),
+        "queue": queue_counts,
+        "entries": int(db_counts),
+        "categories": by_cat,
+        "latest_run": {
+            "run_id": latest_run.get("run_id"),
+            "ok": latest_run.get("ok"),
+            "started_at": latest_run.get("started_at"),
+            "finished_at": latest_run.get("finished_at"),
+            "processed": len(latest_run.get("processed", [])),
+            "errors": len(latest_run.get("errors", [])),
+        } if latest_run else None,
+    }
+
+
+def cmd_list(conn: sqlite3.Connection, category: str | None, limit: int) -> dict[str, Any]:
+    q = (
+        "SELECT tweet_id, title, url, category, post_time, path, quality_score, ingested_at "
+        "FROM entries"
     )
-    return 0 if not errors else 3
+    params: list[Any] = []
+    if category:
+        q += " WHERE category = ?"
+        params.append(category)
+    q += " ORDER BY ingested_at DESC LIMIT ?"
+    params.append(limit)
+    rows = conn.execute(q, params).fetchall()
+    items = [
+        {
+            "tweet_id": r[0],
+            "title": r[1],
+            "url": r[2],
+            "category": r[3],
+            "post_time": r[4],
+            "path": r[5],
+            "quality_score": r[6],
+            "ingested_at": r[7],
+        }
+        for r in rows
+    ]
+    return {"action": "list", "count": len(items), "items": items}
 
 
-def cmd_capture_sync(args: argparse.Namespace, cfg: Config, conn: sqlite3.Connection) -> int:
-    cmd_capture(args, cfg, conn)
-    sync_args = argparse.Namespace(limit=args.limit, no_git=args.no_git)
-    return cmd_sync(sync_args, cfg, conn)
+def cmd_search(conn: sqlite3.Connection, query: str, limit: int) -> dict[str, Any]:
+    if ensure_fts(conn):
+        rows = conn.execute(
+            """
+            SELECT e.tweet_id, e.title, e.url, e.category, e.post_time, e.path,
+                   e.quality_score, bm25(entries_fts) AS score
+            FROM entries_fts
+            JOIN entries e ON e.rowid = entries_fts.rowid
+            WHERE entries_fts MATCH ?
+            ORDER BY score
+            LIMIT ?
+            """,
+            (query, limit),
+        ).fetchall()
+        items = [
+            {
+                "tweet_id": r[0],
+                "title": r[1],
+                "url": r[2],
+                "category": r[3],
+                "post_time": r[4],
+                "path": r[5],
+                "quality_score": r[6],
+                "score": r[7],
+            }
+            for r in rows
+        ]
+        return {"action": "search", "query": query, "engine": "fts5", "count": len(items), "items": items}
+
+    rows = conn.execute(
+        """
+        SELECT tweet_id, title, url, category, post_time, path, quality_score
+        FROM entries
+        WHERE title LIKE ? OR text LIKE ?
+        ORDER BY ingested_at DESC
+        LIMIT ?
+        """,
+        (f"%{query}%", f"%{query}%", limit),
+    ).fetchall()
+    items = [
+        {
+            "tweet_id": r[0],
+            "title": r[1],
+            "url": r[2],
+            "category": r[3],
+            "post_time": r[4],
+            "path": r[5],
+            "quality_score": r[6],
+        }
+        for r in rows
+    ]
+    return {"action": "search", "query": query, "engine": "like", "count": len(items), "items": items}
+
+
+# ---------------------------------------------------------------------------
+# Migration
+# ---------------------------------------------------------------------------
+
+
+def migrate_layout(cfg: Config, apply: bool) -> dict[str, Any]:
+    ensure_layout(cfg)
+    stamp = dt.datetime.now(dt.timezone.utc).strftime("legacy-layout-%Y%m%dT%H%M%SZ")
+    legacy_archive = cfg.archive_root / stamp
+    moves: list[dict[str, str]] = []
+
+    # 1) move old category roots into curated/<category>/
+    for category in ("ai", "eda", "verification", "career", "tools", "misc"):
+        src_dir = cfg.data_root / category
+        if not src_dir.exists():
+            continue
+        for md in src_dir.rglob("*.md"):
+            rel = md.relative_to(src_dir)
+            dst = cfg.curated_root / category / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            if not dst.exists():
+                shutil.copy2(md, dst)
+                moves.append({"from": str(md), "to": str(dst), "mode": "copy"})
+
+        if apply:
+            legacy_archive.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(src_dir), str(legacy_archive / category))
+            moves.append({"from": str(src_dir), "to": str(legacy_archive / category), "mode": "move"})
+
+    # 2) old _raw -> raw/legacy/<date>/
+    old_raw = cfg.data_root / "_raw"
+    if old_raw.exists():
+        for p in old_raw.rglob("*.json"):
+            day = p.parent.name
+            dst = cfg.raw_root / "legacy" / day / p.name
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            if not dst.exists():
+                shutil.copy2(p, dst)
+                moves.append({"from": str(p), "to": str(dst), "mode": "copy"})
+        if apply:
+            legacy_archive.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(old_raw), str(legacy_archive / "_raw"))
+            moves.append({"from": str(old_raw), "to": str(legacy_archive / "_raw"), "mode": "move"})
+
+    # 3) old _state db -> index/bookmarks.sqlite (if index not exists)
+    old_state_db = cfg.data_root / "_state" / "index.sqlite"
+    new_state_db = db_path(cfg)
+    if old_state_db.exists() and not new_state_db.exists():
+        new_state_db.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(old_state_db, new_state_db)
+        moves.append({"from": str(old_state_db), "to": str(new_state_db), "mode": "copy"})
+
+    if (cfg.data_root / "_state").exists() and apply:
+        legacy_archive.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(cfg.data_root / "_state"), str(legacy_archive / "_state"))
+        moves.append({"from": str(cfg.data_root / "_state"), "to": str(legacy_archive / "_state"), "mode": "move"})
+
+    # 4) metadata -> meta
+    old_meta = cfg.data_root / "metadata"
+    if old_meta.exists():
+        for f in old_meta.rglob("*.md"):
+            dst = cfg.meta_root / f.name
+            if not dst.exists():
+                shutil.copy2(f, dst)
+                moves.append({"from": str(f), "to": str(dst), "mode": "copy"})
+        if apply:
+            legacy_archive.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(old_meta), str(legacy_archive / "metadata"))
+            moves.append({"from": str(old_meta), "to": str(legacy_archive / "metadata"), "mode": "move"})
+
+    # 5) old inbox -> state/retry/legacy-<id>.json (best effort)
+    old_inbox = cfg.data_root / "inbox" / "retry"
+    if old_inbox.exists():
+        for md in old_inbox.glob("*.md"):
+            task_id = md.stem
+            payload = {
+                "task_id": f"legacy-{task_id}",
+                "url": "",
+                "raw_text": md.read_text(encoding="utf-8", errors="ignore")[:10000],
+                "tags": ["legacy"],
+                "note": f"migrated from {md}",
+                "source": "legacy",
+                "status": "retry",
+                "attempts": cfg.max_retry,
+                "last_error": "legacy retry item imported as text snapshot",
+                "created_at": utc_now_iso(),
+                "updated_at": utc_now_iso(),
+            }
+            dst = cfg.state_retry / f"legacy-{task_id}.json"
+            if not dst.exists():
+                write_task(dst, payload)
+                moves.append({"from": str(md), "to": str(dst), "mode": "materialize"})
+
+    if (cfg.data_root / "inbox").exists() and apply:
+        legacy_archive.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(cfg.data_root / "inbox"), str(legacy_archive / "inbox"))
+        moves.append({"from": str(cfg.data_root / "inbox"), "to": str(legacy_archive / "inbox"), "mode": "move"})
+
+    return {
+        "action": "migrate",
+        "apply": apply,
+        "archive": str(legacy_archive),
+        "moves": moves,
+        "moved_count": len(moves),
+    }
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Ingest X links into Markdown knowledge base")
+    p = argparse.ArgumentParser(
+        description="x_to_cdns unified CLI (status/path/sync/index/search/list)",
+    )
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    c1 = sub.add_parser("capture", help="Capture X links into inbox")
-    c1.add_argument("--text", required=True, help="Raw message text containing one or more X links")
-    c1.add_argument("--tags", default="", help="Comma-separated tags, e.g. ai,tools")
-    c1.add_argument("--note", default="", help="Optional note")
-    c1.add_argument("--source", default="manual", help="Source label, e.g. openclaw,iphone")
-    c1.set_defaults(func=cmd_capture)
+    c_path = sub.add_parser("path", help="Print canonical paths")
+    c_path.add_argument("--key", default="", help="Optional key (e.g. raw, curated, pending, sqlite)")
 
-    c2 = sub.add_parser("sync", help="Process pending links")
-    c2.add_argument("--limit", type=int, default=30, help="Max pending links to process per run")
-    c2.add_argument("--no-git", action="store_true", help="Do not commit/push git")
-    c2.set_defaults(func=cmd_sync)
+    sub.add_parser("status", help="Show queue/index/run status")
 
-    c3 = sub.add_parser("capture-sync", help="Capture and sync in one command")
-    c3.add_argument("--text", required=True, help="Raw message text containing one or more X links")
-    c3.add_argument("--tags", default="", help="Comma-separated tags, e.g. ai,tools")
-    c3.add_argument("--note", default="", help="Optional note")
-    c3.add_argument("--source", default="manual", help="Source label, e.g. openclaw,iphone")
-    c3.add_argument("--limit", type=int, default=30, help="Max pending links to process per run")
-    c3.add_argument("--no-git", action="store_true", help="Do not commit/push git")
-    c3.set_defaults(func=cmd_capture_sync)
+    c_enqueue = sub.add_parser("enqueue", help="Capture X links into .state/pending")
+    c_enqueue.add_argument("--text", required=True, help="Raw input text containing one or more X links")
+    c_enqueue.add_argument("--tags", default="", help="Comma-separated tags")
+    c_enqueue.add_argument("--note", default="", help="Optional note")
+    c_enqueue.add_argument("--source", default="manual", help="Source label")
+    c_enqueue.add_argument("--force", action="store_true", help="Re-enqueue even if already done")
+
+    c_sync = sub.add_parser("sync", help="Enqueue(optional) + process pending/retry queue")
+    c_sync.add_argument("--text", default="", help="Optional raw input text containing X links")
+    c_sync.add_argument("--tags", default="", help="Comma-separated tags for --text")
+    c_sync.add_argument("--note", default="", help="Optional note for --text")
+    c_sync.add_argument("--source", default="manual", help="Source label for --text")
+    c_sync.add_argument("--force", action="store_true", help="Force enqueue for --text")
+    c_sync.add_argument("--limit", type=int, default=30, help="Max queue items to process")
+    c_sync.add_argument("--no-retry", action="store_true", help="Do not process retry queue in this run")
+    c_sync.add_argument("--no-git", action="store_true", help="Disable auto git commit/push in this run")
+
+    c_index = sub.add_parser("index", help="Rebuild full-text index")
+    c_index.add_argument("--check", action="store_true", help="Only check if FTS5 is available")
+
+    c_search = sub.add_parser("search", help="Search indexed entries")
+    c_search.add_argument("query", help="Query text (FTS5 syntax when available)")
+    c_search.add_argument("--limit", type=int, default=20, help="Max results")
+
+    c_list = sub.add_parser("list", help="List recent entries")
+    c_list.add_argument("--category", default="", help="Filter by category")
+    c_list.add_argument("--limit", type=int, default=30, help="Max results")
+
+    c_migrate = sub.add_parser("migrate", help="Migrate legacy layout to unified contract")
+    c_migrate.add_argument("--apply", action="store_true", help="Apply migration moves (default: dry-run style copy report)")
+
+    # Compatibility aliases (reduce breakage during transition)
+    c_capture = sub.add_parser("capture", help="Alias of enqueue")
+    c_capture.add_argument("--text", required=True)
+    c_capture.add_argument("--tags", default="")
+    c_capture.add_argument("--note", default="")
+    c_capture.add_argument("--source", default="manual")
+    c_capture.add_argument("--force", action="store_true")
+
+    c_capture_sync = sub.add_parser("capture-sync", help="Alias of sync --text ...")
+    c_capture_sync.add_argument("--text", required=True)
+    c_capture_sync.add_argument("--tags", default="")
+    c_capture_sync.add_argument("--note", default="")
+    c_capture_sync.add_argument("--source", default="manual")
+    c_capture_sync.add_argument("--force", action="store_true")
+    c_capture_sync.add_argument("--limit", type=int, default=30)
+    c_capture_sync.add_argument("--no-retry", action="store_true")
+    c_capture_sync.add_argument("--no-git", action="store_true")
 
     return p
 
 
 def main() -> int:
-    parser = build_parser()
-    args = parser.parse_args()
+    args = build_parser().parse_args()
     cfg = load_config()
-    ensure_dirs(cfg)
+    ensure_layout(cfg)
+    cat_cfg = load_categories(cfg)
+
     conn = open_db(cfg)
     try:
-        return int(args.func(args, cfg, conn))
+        if args.cmd == "path":
+            payload = cmd_path(cfg, args.key.strip() or None)
+            print(json.dumps({"action": "path", "data": payload}, ensure_ascii=False))
+            return 0
+
+        if args.cmd == "status":
+            print(json.dumps(cmd_status(cfg, conn), ensure_ascii=False))
+            return 0
+
+        if args.cmd in ("enqueue", "capture"):
+            result = enqueue_links(
+                cfg=cfg,
+                text=args.text,
+                raw_tags=args.tags,
+                note=args.note,
+                source=args.source,
+                force=bool(args.force),
+            )
+            print(json.dumps({"ok": True, "action": "enqueue", **result}, ensure_ascii=False))
+            return 0
+
+        if args.cmd in ("sync", "capture-sync"):
+            queued = {"inserted": 0, "updated": 0, "skipped_done": 0, "captured_urls": []}
+            input_text = args.text.strip() if hasattr(args, "text") else ""
+            if input_text:
+                queued = enqueue_links(
+                    cfg=cfg,
+                    text=input_text,
+                    raw_tags=getattr(args, "tags", ""),
+                    note=getattr(args, "note", ""),
+                    source=getattr(args, "source", "manual"),
+                    force=bool(getattr(args, "force", False)),
+                )
+
+            result = sync_queue(
+                cfg=cfg,
+                cat_cfg=cat_cfg,
+                conn=conn,
+                limit=int(getattr(args, "limit", 30)),
+                with_retry=not bool(getattr(args, "no_retry", False)),
+                no_git=bool(getattr(args, "no_git", False)),
+            )
+            result["queued"] = queued
+            print(json.dumps(result, ensure_ascii=False))
+            return 0 if result.get("ok") else 3
+
+        if args.cmd == "index":
+            ok = ensure_fts(conn)
+            if args.check:
+                print(json.dumps({"action": "index", "fts5": ok, "sqlite": str(db_path(cfg))}, ensure_ascii=False))
+                return 0 if ok else 2
+            rebuilt = rebuild_fts(conn)
+            total = conn.execute("SELECT COUNT(*) FROM entries").fetchone()[0]
+            print(json.dumps({"action": "index", "fts5": rebuilt, "entries": int(total)}, ensure_ascii=False))
+            return 0 if rebuilt else 2
+
+        if args.cmd == "search":
+            payload = cmd_search(conn, query=args.query, limit=args.limit)
+            print(json.dumps(payload, ensure_ascii=False))
+            return 0
+
+        if args.cmd == "list":
+            payload = cmd_list(conn, category=args.category.strip() or None, limit=args.limit)
+            print(json.dumps(payload, ensure_ascii=False))
+            return 0
+
+        if args.cmd == "migrate":
+            payload = migrate_layout(cfg, apply=bool(args.apply))
+            print(json.dumps(payload, ensure_ascii=False))
+            return 0
+
+        raise CliError(f"Unsupported command: {args.cmd}")
+    except CliError as exc:
+        print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False))
+        return 2
     finally:
         conn.close()
 
 
 if __name__ == "__main__":
-    try:
-        raise SystemExit(main())
-    except IngestError as exc:
-        print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False))
-        raise SystemExit(2)
+    raise SystemExit(main())

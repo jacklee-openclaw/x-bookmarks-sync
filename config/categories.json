@@ -1,0 +1,55 @@
+{
+  "version": 1,
+  "default_category": "misc",
+  "rules": [
+    {
+      "name": "github",
+      "match": ["github.com"],
+      "action": "file",
+      "folder": "tools",
+      "template": "bookmark"
+    },
+    {
+      "name": "ai",
+      "match": [" ai ", "llm", "gpt", "agent", "anthropic", "openai", "模型", "智能体"],
+      "action": "file",
+      "folder": "ai",
+      "template": "bookmark"
+    },
+    {
+      "name": "eda",
+      "match": ["eda", "asic", "rtl", "timing", "cadence", "synopsys", "芯片"],
+      "action": "file",
+      "folder": "eda",
+      "template": "bookmark"
+    },
+    {
+      "name": "verification",
+      "match": ["verification", "uvm", "formal", "coverage", "assertion", "验证"],
+      "action": "file",
+      "folder": "verification",
+      "template": "bookmark"
+    },
+    {
+      "name": "career",
+      "match": ["career", "interview", "management", "hiring", "职业", "面试"],
+      "action": "file",
+      "folder": "career",
+      "template": "bookmark"
+    },
+    {
+      "name": "tools",
+      "match": ["tool", "automation", "script", "workflow", "效率", "自动化", "工具"],
+      "action": "file",
+      "folder": "tools",
+      "template": "bookmark"
+    },
+    {
+      "name": "default",
+      "match": [],
+      "action": "file",
+      "folder": "misc",
+      "template": "bookmark"
+    }
+  ]
+}

@@ -9,11 +9,14 @@ if [[ -f ".env" ]]; then
   source ".env"
 fi
 
-LOCK_DIR="/tmp/x_to_cdns_sync.lock"
+STATE_ROOT="${KB_STATE_ROOT:-.state}"
+LOCK_DIR="$STATE_ROOT/locks/openclaw-sync.lock"
+mkdir -p "$STATE_ROOT/locks"
 if ! mkdir "$LOCK_DIR" 2>/dev/null; then
   echo "[INFO] sync is already running, skip."
   exit 0
 fi
 trap 'rmdir "$LOCK_DIR" >/dev/null 2>&1 || true' EXIT
 
-python3 x_links_to_kb.py sync
+SYNC_LIMIT="${KB_SYNC_LIMIT:-30}"
+python3 x_links_to_kb.py sync --limit "$SYNC_LIMIT"

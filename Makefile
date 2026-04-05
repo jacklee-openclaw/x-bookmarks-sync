@@ -1,28 +1,41 @@
 PYTHON ?= python3
 
-.PHONY: sync sync-no-git init-git check kb-capture kb-sync kb-capture-sync
-
-sync:
-	$(PYTHON) sync_bookmarks.py
-
-sync-no-git:
-	$(PYTHON) sync_bookmarks.py --no-git
-
-init-git:
-	git init
-	git add .
-	git commit -m "chore: bootstrap x bookmarks sync tool"
+.PHONY: check status path enqueue sync index search list migrate migrate-apply legacy-sync legacy-sync-no-git
 
 check:
-	PYTHONPYCACHEPREFIX=.pycache $(PYTHON) -m py_compile sync_bookmarks.py x_links_to_kb.py
+	PYTHONPYCACHEPREFIX=.pycache $(PYTHON) -m py_compile legacy/sync_bookmarks.py x_links_to_kb.py
 
-kb-capture:
-	@if [ -z "$(TEXT)" ]; then echo "Usage: make kb-capture TEXT='https://x.com/.../status/123'"; exit 1; fi
-	$(PYTHON) x_links_to_kb.py capture --text "$(TEXT)"
+status:
+	$(PYTHON) x_links_to_kb.py status
 
-kb-sync:
+path:
+	$(PYTHON) x_links_to_kb.py path
+
+enqueue:
+	@if [ -z "$(TEXT)" ]; then echo "Usage: make enqueue TEXT='https://x.com/.../status/123'"; exit 1; fi
+	$(PYTHON) x_links_to_kb.py enqueue --text "$(TEXT)"
+
+sync:
 	$(PYTHON) x_links_to_kb.py sync
 
-kb-capture-sync:
-	@if [ -z "$(TEXT)" ]; then echo "Usage: make kb-capture-sync TEXT='https://x.com/.../status/123'"; exit 1; fi
-	$(PYTHON) x_links_to_kb.py capture-sync --text "$(TEXT)"
+index:
+	$(PYTHON) x_links_to_kb.py index
+
+search:
+	@if [ -z "$(Q)" ]; then echo "Usage: make search Q='agent workflow'"; exit 1; fi
+	$(PYTHON) x_links_to_kb.py search "$(Q)"
+
+list:
+	$(PYTHON) x_links_to_kb.py list
+
+migrate:
+	$(PYTHON) x_links_to_kb.py migrate
+
+migrate-apply:
+	$(PYTHON) x_links_to_kb.py migrate --apply
+
+legacy-sync:
+	$(PYTHON) legacy/sync_bookmarks.py
+
+legacy-sync-no-git:
+	$(PYTHON) legacy/sync_bookmarks.py --no-git
