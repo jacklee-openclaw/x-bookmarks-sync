@@ -8,6 +8,9 @@
 - 图片说明: {{image_alts}}
 - 抓取质量: {{quality_score}}
 - 抓取来源: {{source_mode}}
+- 原文归档(JSON): {{original_archive_json}}
+- 原文归档(HTML): {{original_archive_html}}
+- 原文归档(MD): {{original_archive_md}}
 
 ## 核心观点
 {{key_points}}

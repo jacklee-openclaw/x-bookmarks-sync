@@ -2,59 +2,62 @@
 
 ## 1. Layers
 
-- Raw layer: `x-bookmarks/raw/<source>/<YYYY-MM-DD>/<tweet_id>.json`
+- Raw archive layer: `x-bookmarks/raw/<source>/<YYYY-MM-DD>/`
+  - `<tweet_id>.json` (structured archive)
+  - `<tweet_id>.html` (html snapshot)
+  - `<tweet_id>.md` (readable original markdown)
+  - `assets/<tweet_id>/` (media cache, best effort)
 - Curated layer: `x-bookmarks/curated/<category>/<YYYY-MM-DD>/<title>.md`
 - Index layer: `x-bookmarks/index/bookmarks.sqlite`
 - Meta layer: `x-bookmarks/meta/run-log.jsonl`
-- Archive layer: `x-bookmarks/archive/` (legacy layout and quarantine)
+- Archive/quarantine layer: `x-bookmarks/archive/`
 - Runtime state: `.state/{pending,processing,done,error,retry,locks,runs}`
 
 ## 2. Queue Task Schema
 
 Each queue file (`.state/<state>/<task_id>.json`) keeps:
-- `task_id`: tweet id (string)
-- `url`: canonical X URL
-- `raw_text`: original inbound message
-- `tags`: parsed tags
-- `note`: optional note
-- `source`: source label (`manual`, `telegram-auto`, ...)
-- `status`: one of pending/processing/done/error/retry
-- `attempts`: integer retry counter
-- `last_error`: last failure message
-- `created_at` / `updated_at`: UTC ISO8601
+- `task_id`, `url`, `raw_text`, `tags`, `note`, `source`
+- `status` in `pending/processing/done/error/retry`
+- `attempts`, `last_error`
+- `created_at`, `updated_at`
 
 ## 3. State Machine
 
-`pending -> processing -> done`
+Base flow:
+- `pending -> processing -> done`
 
-Failure transitions:
-- if `attempts <= KB_MAX_RETRY`: `processing -> retry`
-- else: `processing -> error`
+Failure flow:
+- generic fetch/runtime error: `processing -> retry -> error` (bounded by `KB_MAX_RETRY`)
+- degraded capture (quality gate reject): `processing -> error`
 
-`retry` entries are re-consumed by `sync` unless `--no-retry` is set.
+## 4. Archive-First Contract
 
-## 4. Classification Contract
+Per task process order:
+1. fetch content candidates (x api/oembed/browser)
+2. write raw archive files (`json/html/md/assets`)
+3. evaluate quality gate
+4. if pass: generate curated + update index
+5. if reject: do not write curated, move task to error/retry and log reason
 
-Rules are loaded from `config/categories.json` with fields:
-- `match`: keyword array
-- `action`: currently `file`
-- `folder`: target category folder
-- `template`: template basename in `templates/`
+## 5. Quality Gate Contract
 
-Priority:
-1. explicit tags match rule `name`/`folder`
-2. text/url keyword match
-3. `default_category`
+Input checks:
+- marker hits (`sign up`, `log in`, `don’t miss what’s happening`, etc.)
+- text completeness/length
+- essential fields (author/post_time)
+- score threshold (`KB_MIN_ACCEPT_SCORE`)
 
-## 5. Observability Contract
+Output fields in raw json:
+- `quality_score`
+- `quality_flags`
+- `marker_hits`
 
-Per run:
-- `.state/runs/<run_id>.json` includes queue stats, processed entries, errors, git status.
+## 6. Index Contract
 
-Summary stream:
-- append one JSON line to `x-bookmarks/meta/run-log.jsonl`.
+`entries` table stores only accepted captures (`capture_status='ok'`).
+Search/List queries filter by `capture_status` to avoid indexing degraded pages.
 
-## 6. Git Contract
+## 7. Git Contract
 
-- Default push scope: `x-bookmarks/`
-- State directory is excluded from git push unless `KB_GIT_INCLUDE_STATE=1`.
+Default git scope is `x-bookmarks/`.
+State directory is excluded unless `KB_GIT_INCLUDE_STATE=1`.

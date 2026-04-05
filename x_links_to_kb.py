@@ -14,6 +14,7 @@ import argparse
 import datetime as dt
 import html
 import json
+import mimetypes
 import os
 import re
 import shlex
@@ -40,10 +41,44 @@ SPACE_RE = re.compile(r"\s+")
 URL_RE = re.compile(r"https?://\S+", flags=re.IGNORECASE)
 
 QUEUE_STATES = ("pending", "processing", "done", "error", "retry")
+DEGRADED_MARKERS = [
+    "don’t miss what’s happening",
+    "don't miss what's happening",
+    "log in",
+    "sign up",
+    "join x today",
+    "new to x",
+    "create account",
+    "terms of service",
+    "privacy policy",
+    "cookie policy",
+    "ads info",
+]
 
 
 class CliError(Exception):
     """Raised when an operation cannot continue safely."""
+
+
+class CaptureQualityError(CliError):
+    """Raised when capture is degraded and must not be curated."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason_codes: list[str] | None = None,
+        archive_json_path: str = "",
+        archive_md_path: str = "",
+        archive_html_path: str = "",
+        quality_score: int = 0,
+    ) -> None:
+        super().__init__(message)
+        self.reason_codes = reason_codes or []
+        self.archive_json_path = archive_json_path
+        self.archive_md_path = archive_md_path
+        self.archive_html_path = archive_html_path
+        self.quality_score = quality_score
 
 
 @dataclass
@@ -91,6 +126,9 @@ class Config:
     browser_fallback_enabled: bool
     browser_fallback_cmd: str | None
     browser_fallback_timeout_sec: int
+    min_accept_score: int
+    download_media: bool
+    max_media_download: int
 
     max_retry: int
     auto_git_push: bool
@@ -147,6 +185,9 @@ def load_config() -> Config:
     browser_fallback_enabled = os.environ.get("KB_BROWSER_FALLBACK_ENABLED", "1") == "1"
     browser_fallback_cmd = os.environ.get("KB_BROWSER_FALLBACK_CMD", "").strip() or None
     browser_fallback_timeout_sec = int(os.environ.get("KB_BROWSER_FALLBACK_TIMEOUT_SEC", "25"))
+    min_accept_score = int(os.environ.get("KB_MIN_ACCEPT_SCORE", "70"))
+    download_media = os.environ.get("KB_DOWNLOAD_MEDIA", "1") == "1"
+    max_media_download = int(os.environ.get("KB_MAX_MEDIA_DOWNLOAD", "4"))
 
     max_retry = int(os.environ.get("KB_MAX_RETRY", "2"))
     auto_git_push = os.environ.get("KB_AUTO_GIT_PUSH", "0") == "1"
@@ -182,6 +223,9 @@ def load_config() -> Config:
         browser_fallback_enabled=browser_fallback_enabled,
         browser_fallback_cmd=browser_fallback_cmd,
         browser_fallback_timeout_sec=browser_fallback_timeout_sec,
+        min_accept_score=min_accept_score,
+        download_media=download_media,
+        max_media_download=max_media_download,
         max_retry=max_retry,
         auto_git_push=auto_git_push,
         git_remote=git_remote,
@@ -389,6 +433,9 @@ def ensure_default_template(cfg: Config) -> None:
 - 图片说明: {{image_alts}}
 - 抓取质量: {{quality_score}}
 - 抓取来源: {{source_mode}}
+- 原文归档(JSON): {{original_archive_json}}
+- 原文归档(HTML): {{original_archive_html}}
+- 原文归档(MD): {{original_archive_md}}
 
 ## 核心观点
 {{key_points}}
@@ -591,7 +638,7 @@ def fetch_linked_page_text(cfg: Config, text: str) -> dict[str, str]:
         cleaned = re.sub(r"<style[\s\S]*?</style>", " ", cleaned, flags=re.IGNORECASE)
         cleaned = re.sub(r"<[^>]+>", " ", cleaned)
         plain = html.unescape(SPACE_RE.sub(" ", cleaned)).strip()
-        return {"title": title[:120], "text": plain[:12000]}
+        return {"title": title[:120], "text": plain[:12000], "html": raw[:400000], "url": link}
     except Exception:
         return {}
 
@@ -636,6 +683,8 @@ def fetch_with_browser_fallback(cfg: Config, url: str) -> dict[str, str]:
             "title": str(obj.get("title", "")).strip(),
             "text": str(obj.get("text", "")).strip(),
             "source": str(obj.get("source", "browser-playwright")).strip() or "browser-playwright",
+            "html": str(obj.get("html", "")).strip(),
+            "media_json": json.dumps(obj.get("media", []), ensure_ascii=False),
         }
     except Exception:
         return {}
@@ -657,17 +706,323 @@ def sanitize_filename(name: str) -> str:
     return (s or "untitled")[:100]
 
 
-def quality_score(text: str, source_mode: str, min_len: int) -> int:
+def find_degraded_markers(*chunks: str) -> list[str]:
+    corpus = " ".join(chunks).lower()
+    return sorted({m for m in DEGRADED_MARKERS if m in corpus})
+
+
+def quality_score(text: str, source_mode: str, min_len: int, marker_count: int = 0) -> int:
     score = 100
     if looks_incomplete(text, min_len):
         score -= 45
     if len(text.strip()) < 280:
         score -= 15
+    if marker_count > 0:
+        score -= min(40, 18 + marker_count * 4)
     if source_mode == "oembed":
         score -= 10
     if source_mode == "browser-playwright":
         score += 5
     return max(0, min(score, 100))
+
+
+def evaluate_capture_quality(
+    cfg: Config,
+    *,
+    text: str,
+    title: str,
+    author_name: str,
+    post_time: str,
+    source_mode: str,
+    page_html: str,
+) -> dict[str, Any]:
+    reasons: list[str] = []
+    hits = find_degraded_markers(text, title, page_html)
+    strong_markers = {
+        "don’t miss what’s happening",
+        "don't miss what's happening",
+        "new to x",
+        "join x today",
+        "terms of service",
+        "privacy policy",
+        "cookie policy",
+    }
+    if any(h in strong_markers for h in hits) or len(hits) >= 3:
+        reasons.append("login_or_placeholder_markers")
+    if looks_incomplete(text, cfg.content_min_len):
+        reasons.append("text_incomplete")
+    if len((text or "").strip()) < cfg.content_min_len:
+        reasons.append("text_too_short")
+    if not (author_name or "").strip():
+        reasons.append("missing_author")
+    if not (post_time or "").strip():
+        reasons.append("missing_post_time")
+
+    score = quality_score(text, source_mode, cfg.content_min_len, marker_count=len(hits))
+    degraded = bool(hits) or score < cfg.min_accept_score
+    return {
+        "score": score,
+        "degraded": degraded,
+        "reason_codes": reasons,
+        "marker_hits": hits,
+    }
+
+
+def guess_ext_from_url(url: str) -> str:
+    parsed = urllib.parse.urlparse(url)
+    suffix = Path(parsed.path).suffix.lower()
+    if suffix in {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp"}:
+        return suffix
+    return ".bin"
+
+
+def render_original_archive_markdown(
+    cfg: Config,
+    *,
+    tweet_id: str,
+    url: str,
+    title: str,
+    author_name: str,
+    author_username: str,
+    post_time: str,
+    source_mode: str,
+    quality_score_value: int,
+    quality_flags: list[str],
+    marker_hits: list[str],
+    text: str,
+    thread_context: str,
+    media: list[dict[str, Any]],
+    archive_json_path: Path,
+    archive_html_path: Path,
+) -> str:
+    ensure_default_template(cfg)
+    tpath = cfg.templates_root / "original_archive.md"
+    if not tpath.exists():
+        tpath.write_text(
+            """# {{title}}
+- tweet_id: {{tweet_id}}
+- author: {{author}}
+- post_time: {{post_time}}
+- url: {{url}}
+- source_mode: {{source_mode}}
+- quality_score: {{quality_score}}
+- quality_flags: {{quality_flags}}
+- marker_hits: {{marker_hits}}
+- archive_json: {{archive_json}}
+- archive_html: {{archive_html}}
+- thread_context: {{thread_context}}
+
+## Raw Text
+```text
+{{text}}
+```
+
+## Media
+{{media_lines}}
+""",
+            encoding="utf-8",
+        )
+
+    author = author_name or "unknown"
+    if author_username:
+        author = f"{author} (@{author_username})"
+    media_lines = []
+    for m in media:
+        line = f"- url: {m.get('url', '')}"
+        alt = str(m.get("alt", "")).strip()
+        if alt:
+            line += f" | alt: {alt}"
+        local = str(m.get("local_path", "")).strip()
+        if local:
+            line += f" | local: {local}"
+        err = str(m.get("download_error", "")).strip()
+        if err:
+            line += f" | download_error: {err}"
+        media_lines.append(line)
+    if not media_lines:
+        media_lines = ["- (none)"]
+
+    return render_template(
+        tpath,
+        {
+            "title": title,
+            "tweet_id": tweet_id,
+            "author": author,
+            "post_time": post_time or "unknown",
+            "url": url,
+            "source_mode": source_mode,
+            "quality_score": str(quality_score_value),
+            "quality_flags": ", ".join(quality_flags) if quality_flags else "none",
+            "marker_hits": ", ".join(marker_hits) if marker_hits else "none",
+            "archive_json": str(archive_json_path),
+            "archive_html": str(archive_html_path),
+            "thread_context": thread_context or "unknown",
+            "text": text or "（empty）",
+            "media_lines": "\n".join(media_lines),
+        },
+    )
+
+
+def collect_media_candidates(
+    meta_payload: dict[str, Any],
+    browser_media: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    includes = meta_payload.get("includes") or {}
+    for item in includes.get("media") or []:
+        url = str(item.get("url") or item.get("preview_image_url") or "").strip()
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        out.append(
+            {
+                "url": url,
+                "alt": str(item.get("alt_text", "")).strip(),
+                "source": "x_api_media",
+            }
+        )
+
+    for item in browser_media:
+        url = str(item.get("url", "")).strip()
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        out.append(
+            {
+                "url": url,
+                "alt": str(item.get("alt", "")).strip(),
+                "source": str(item.get("source", "browser")).strip() or "browser",
+            }
+        )
+    return out
+
+
+def download_media_assets(
+    cfg: Config,
+    *,
+    media: list[dict[str, Any]],
+    assets_dir: Path,
+) -> list[dict[str, Any]]:
+    assets_dir.mkdir(parents=True, exist_ok=True)
+    result: list[dict[str, Any]] = []
+    for idx, item in enumerate(media[: max(0, cfg.max_media_download)], start=1):
+        row = dict(item)
+        url = str(item.get("url", "")).strip()
+        if not url.startswith("http"):
+            row["download_error"] = "non_http_url"
+            result.append(row)
+            continue
+        ext = guess_ext_from_url(url)
+        file_name = f"media-{idx:03d}{ext}"
+        out_path = assets_dir / file_name
+        try:
+            req = urllib.request.Request(url, method="GET", headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=cfg.request_timeout_sec) as resp:
+                blob = resp.read(4_000_000)
+                ctype = str(resp.headers.get("Content-Type", "")).split(";")[0].strip()
+                if ext == ".bin" and ctype:
+                    guessed = mimetypes.guess_extension(ctype) or ".bin"
+                    out_path = assets_dir / f"media-{idx:03d}{guessed}"
+                out_path.write_bytes(blob)
+            row["local_path"] = str(out_path)
+        except Exception as exc:
+            row["download_error"] = str(exc)
+        result.append(row)
+    for item in media[cfg.max_media_download :]:
+        row = dict(item)
+        row["download_error"] = "skipped_by_max_media_download"
+        result.append(row)
+    return result
+
+
+def write_original_archive(
+    cfg: Config,
+    *,
+    tweet_id: str,
+    url: str,
+    title: str,
+    author_name: str,
+    author_username: str,
+    post_time: str,
+    source_mode: str,
+    text: str,
+    thread_context: str,
+    quality_score_value: int,
+    quality_flags: list[str],
+    marker_hits: list[str],
+    raw_payload: dict[str, Any],
+    page_html: str,
+    media: list[dict[str, Any]],
+) -> dict[str, str]:
+    day = dt.date.today().isoformat()
+    mode = sanitize_filename(source_mode or "unknown").lower()
+    mode_dir = cfg.raw_root / mode / day
+    mode_dir.mkdir(parents=True, exist_ok=True)
+    assets_dir = mode_dir / "assets" / tweet_id
+
+    resolved_media = media
+    if cfg.download_media and media:
+        resolved_media = download_media_assets(cfg, media=media, assets_dir=assets_dir)
+
+    html_snapshot = page_html.strip()
+    if not html_snapshot:
+        html_snapshot = (
+            "<html><body><h1>Capture Snapshot</h1><pre>"
+            + html.escape((text or "").strip())
+            + "</pre></body></html>"
+        )
+
+    archive_json_path = mode_dir / f"{tweet_id}.json"
+    archive_html_path = mode_dir / f"{tweet_id}.html"
+    archive_md_path = mode_dir / f"{tweet_id}.md"
+
+    payload = {
+        "tweet_id": tweet_id,
+        "url": url,
+        "title": title,
+        "author_name": author_name,
+        "author_username": author_username,
+        "post_time": post_time,
+        "source_mode": source_mode,
+        "captured_at": utc_now_iso(),
+        "thread_context": thread_context,
+        "text": text,
+        "quality_score": quality_score_value,
+        "quality_flags": quality_flags,
+        "marker_hits": marker_hits,
+        "media": resolved_media,
+        "raw_payload": raw_payload,
+    }
+    archive_json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    archive_html_path.write_text(html_snapshot, encoding="utf-8")
+
+    archive_md = render_original_archive_markdown(
+        cfg,
+        tweet_id=tweet_id,
+        url=url,
+        title=title,
+        author_name=author_name,
+        author_username=author_username,
+        post_time=post_time,
+        source_mode=source_mode,
+        quality_score_value=quality_score_value,
+        quality_flags=quality_flags,
+        marker_hits=marker_hits,
+        text=text,
+        thread_context=thread_context,
+        media=resolved_media,
+        archive_json_path=archive_json_path,
+        archive_html_path=archive_html_path,
+    )
+    archive_md_path.write_text(archive_md, encoding="utf-8")
+    return {
+        "json_path": str(archive_json_path),
+        "html_path": str(archive_html_path),
+        "md_path": str(archive_md_path),
+        "assets_dir": str(assets_dir),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -677,6 +1032,13 @@ def quality_score(text: str, source_mode: str, min_len: int) -> int:
 
 def db_path(cfg: Config) -> Path:
     return cfg.index_root / "bookmarks.sqlite"
+
+
+def ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl_type: str) -> None:
+    cols = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    if column in cols:
+        return
+    conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl_type}")
 
 
 def open_db(cfg: Config) -> sqlite3.Connection:
@@ -697,13 +1059,24 @@ def open_db(cfg: Config) -> sqlite3.Connection:
           post_time TEXT,
           source_mode TEXT,
           quality_score INTEGER,
+          raw_json_path TEXT,
+          original_md_path TEXT,
+          original_html_path TEXT,
+          capture_status TEXT,
+          quality_flags_json TEXT,
           ingested_at TEXT NOT NULL
         )
         """
     )
+    ensure_column(conn, "entries", "raw_json_path", "TEXT")
+    ensure_column(conn, "entries", "original_md_path", "TEXT")
+    ensure_column(conn, "entries", "original_html_path", "TEXT")
+    ensure_column(conn, "entries", "capture_status", "TEXT")
+    ensure_column(conn, "entries", "quality_flags_json", "TEXT")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_entries_category ON entries(category)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_entries_post_time ON entries(post_time)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_entries_ingested_at ON entries(ingested_at)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_entries_capture_status ON entries(capture_status)")
     conn.commit()
     return conn
 
@@ -742,8 +1115,9 @@ def upsert_entry(conn: sqlite3.Connection, entry: dict[str, Any]) -> None:
         """
         INSERT INTO entries (
           tweet_id, url, title, text, category, action, path, tags_json,
-          author_name, author_username, post_time, source_mode, quality_score, ingested_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          author_name, author_username, post_time, source_mode, quality_score,
+          raw_json_path, original_md_path, original_html_path, capture_status, quality_flags_json, ingested_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(tweet_id) DO UPDATE SET
           url=excluded.url,
           title=excluded.title,
@@ -757,6 +1131,11 @@ def upsert_entry(conn: sqlite3.Connection, entry: dict[str, Any]) -> None:
           post_time=excluded.post_time,
           source_mode=excluded.source_mode,
           quality_score=excluded.quality_score,
+          raw_json_path=excluded.raw_json_path,
+          original_md_path=excluded.original_md_path,
+          original_html_path=excluded.original_html_path,
+          capture_status=excluded.capture_status,
+          quality_flags_json=excluded.quality_flags_json,
           ingested_at=excluded.ingested_at
         """,
         (
@@ -773,9 +1152,53 @@ def upsert_entry(conn: sqlite3.Connection, entry: dict[str, Any]) -> None:
             entry.get("post_time", ""),
             entry.get("source_mode", ""),
             int(entry.get("quality_score", 0)),
+            entry.get("raw_json_path", ""),
+            entry.get("original_md_path", ""),
+            entry.get("original_html_path", ""),
+            entry.get("capture_status", "ok"),
+            json.dumps(entry.get("quality_flags", []), ensure_ascii=False),
             entry["ingested_at"],
         ),
     )
+
+
+def quarantine_existing_entry(
+    cfg: Config,
+    conn: sqlite3.Connection,
+    *,
+    tweet_id: str,
+    reason: str,
+) -> str:
+    row = conn.execute("SELECT path FROM entries WHERE tweet_id = ?", (tweet_id,)).fetchone()
+    quarantine_path = ""
+    if row and row[0]:
+        src = Path(str(row[0]))
+        if src.exists():
+            qdir = cfg.archive_root / "quarantine" / "degraded-curated" / dt.date.today().isoformat()
+            qdir.mkdir(parents=True, exist_ok=True)
+            dst = qdir / f"{src.stem}-{tweet_id}.md"
+            if dst.exists():
+                dst = qdir / f"{src.stem}-{tweet_id}-{int(dt.datetime.now().timestamp())}.md"
+            shutil.move(str(src), str(dst))
+            quarantine_path = str(dst)
+    conn.execute("DELETE FROM entries WHERE tweet_id = ?", (tweet_id,))
+    conn.commit()
+    if quarantine_path:
+        marker = cfg.meta_root / "degraded-quarantine.jsonl"
+        with marker.open("a", encoding="utf-8") as f:
+            f.write(
+                json.dumps(
+                    {
+                        "tweet_id": tweet_id,
+                        "reason": reason,
+                        "quarantine_path": quarantine_path,
+                        "timestamp": utc_now_iso(),
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+    return quarantine_path
 
 
 # ---------------------------------------------------------------------------
@@ -884,16 +1307,6 @@ def release_lock(lock: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def write_raw_payload(cfg: Config, tweet_id: str, payload: dict[str, Any], source_mode: str) -> Path:
-    day = dt.date.today().isoformat()
-    mode = sanitize_filename(source_mode or "unknown").lower()
-    mode_dir = cfg.raw_root / mode / day
-    mode_dir.mkdir(parents=True, exist_ok=True)
-    fp = mode_dir / f"{tweet_id}.json"
-    fp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    return fp
-
-
 def process_one_task(
     cfg: Config,
     cat_cfg: CategoryConfig,
@@ -904,9 +1317,11 @@ def process_one_task(
     tweet_id = extract_tweet_id(url)
     tags = [str(x).strip().lower() for x in task.get("tags", []) if str(x).strip()]
 
+    primary_fetch = "oembed"
     if cfg.x_access_token:
         try:
             meta = fetch_with_x_api(cfg, tweet_id)
+            primary_fetch = "x_api"
         except Exception:
             meta = fetch_with_oembed(cfg, url)
     else:
@@ -926,11 +1341,18 @@ def process_one_task(
         content_text = linked["text"]
 
     browser = {}
+    browser_media: list[dict[str, Any]] = []
     if looks_incomplete(content_text, cfg.content_min_len):
         browser = fetch_with_browser_fallback(cfg, url)
         if browser.get("text"):
             content_text = browser["text"]
             source_mode = browser.get("source", source_mode)
+        try:
+            browser_media = json.loads(browser.get("media_json", "[]"))
+            if not isinstance(browser_media, list):
+                browser_media = []
+        except Exception:
+            browser_media = []
 
     rule = choose_rule(cat_cfg, tags, content_text, url)
     category = rule.folder
@@ -947,7 +1369,66 @@ def process_one_task(
     points = split_key_points(content_text, max_points=3)
     points_block = "\n".join(f"- {p}" for p in points if p.strip()) or "- （待补充）"
 
-    score = quality_score(content_text, source_mode, cfg.content_min_len)
+    page_html = str(browser.get("html", "")).strip() or str(linked.get("html", "")).strip()
+    meta_raw_payload = meta.get("raw_payload") or {}
+    if not page_html:
+        page_html = str(((meta_raw_payload.get("oembed") or {}).get("html", ""))).strip()
+
+    q = evaluate_capture_quality(
+        cfg,
+        text=content_text,
+        title=title,
+        author_name=author_name,
+        post_time=post_time,
+        source_mode=source_mode,
+        page_html=page_html,
+    )
+    score = int(q["score"])
+    quality_flags = list(q["reason_codes"])
+    marker_hits = list(q["marker_hits"])
+
+    media_candidates = collect_media_candidates(meta_raw_payload, browser_media)
+    archive_raw_payload = {
+        "primary_fetch": primary_fetch,
+        "source_mode": source_mode,
+        "meta_raw_payload": meta_raw_payload,
+        "linked_page": linked,
+        "browser_fallback": {
+            "title": browser.get("title", ""),
+            "text": browser.get("text", ""),
+            "html_size": len(str(browser.get("html", ""))),
+            "media_count": len(browser_media),
+        },
+    }
+    archive_paths = write_original_archive(
+        cfg,
+        tweet_id=tweet_id,
+        url=url,
+        title=title,
+        author_name=author_name,
+        author_username=author_username,
+        post_time=post_time,
+        source_mode=source_mode,
+        text=content_text,
+        thread_context=thread_context,
+        quality_score_value=score,
+        quality_flags=quality_flags,
+        marker_hits=marker_hits,
+        raw_payload=archive_raw_payload,
+        page_html=page_html,
+        media=media_candidates,
+    )
+
+    if q["degraded"]:
+        reason_text = ", ".join(quality_flags) if quality_flags else "quality_gate_rejected"
+        raise CaptureQualityError(
+            f"degraded capture rejected: {reason_text}",
+            reason_codes=quality_flags,
+            archive_json_path=archive_paths["json_path"],
+            archive_md_path=archive_paths["md_path"],
+            archive_html_path=archive_paths["html_path"],
+            quality_score=score,
+        )
 
     ensure_default_template(cfg)
     template_name = f"{rule.template}.md"
@@ -974,6 +1455,9 @@ def process_one_task(
             "image_alts": "；".join(image_alts) if image_alts else "（未抓取到）",
             "source_mode": source_mode,
             "quality_score": str(score),
+            "original_archive_md": archive_paths["md_path"],
+            "original_archive_json": archive_paths["json_path"],
+            "original_archive_html": archive_paths["html_path"],
             "key_points": points_block,
             "quote_text": quote_text,
             "full_text": full_text,
@@ -1000,8 +1484,6 @@ def process_one_task(
         cap_file.write_text(old + block, encoding="utf-8")
         written_path = str(cap_file)
 
-    raw_path = write_raw_payload(cfg, tweet_id, meta.get("raw_payload") or {}, source_mode)
-
     entry = {
         "tweet_id": tweet_id,
         "url": url,
@@ -1016,6 +1498,11 @@ def process_one_task(
         "post_time": post_time,
         "source_mode": source_mode,
         "quality_score": score,
+        "raw_json_path": archive_paths["json_path"],
+        "original_md_path": archive_paths["md_path"],
+        "original_html_path": archive_paths["html_path"],
+        "capture_status": "ok",
+        "quality_flags": quality_flags,
         "ingested_at": utc_now_iso(),
     }
     upsert_entry(conn, entry)
@@ -1027,7 +1514,11 @@ def process_one_task(
         "category": category,
         "action": action,
         "path": written_path,
-        "raw_path": str(raw_path),
+        "raw_path": archive_paths["json_path"],
+        "original_md_path": archive_paths["md_path"],
+        "original_html_path": archive_paths["html_path"],
+        "quality_flags": quality_flags,
+        "marker_hits": marker_hits,
         "source_mode": source_mode,
         "quality_score": score,
     }
@@ -1046,6 +1537,7 @@ def write_run_log(cfg: Config, record: dict[str, Any]) -> Path:
         "seen": record["pending_seen"],
         "processed": len(record["processed"]),
         "errors": len(record["errors"]),
+        "degraded": len([e for e in record["errors"] if str(e.get("error_type", "")) == "degraded_capture"]),
         "git": record.get("git", {}),
     }
     with summary_path.open("a", encoding="utf-8") as f:
@@ -1133,8 +1625,31 @@ def sync_queue(
                 conn.rollback()
                 task["last_error"] = str(exc)
                 target = "retry" if task["attempts"] <= cfg.max_retry else "error"
+                if isinstance(exc, CaptureQualityError):
+                    target = "error"
                 move_task(cfg, task, "processing", target)
-                errors.append({"task_id": task["task_id"], "url": task.get("url", ""), "error": str(exc), "to": target})
+                err_item: dict[str, Any] = {
+                    "task_id": task["task_id"],
+                    "url": task.get("url", ""),
+                    "error": str(exc),
+                    "to": target,
+                }
+                if isinstance(exc, CaptureQualityError):
+                    quarantine_path = quarantine_existing_entry(
+                        cfg,
+                        conn,
+                        tweet_id=str(task.get("task_id", "")).strip(),
+                        reason=str(exc),
+                    )
+                    err_item["error_type"] = "degraded_capture"
+                    err_item["reason_codes"] = exc.reason_codes
+                    err_item["quality_score"] = exc.quality_score
+                    err_item["archive_json_path"] = exc.archive_json_path
+                    err_item["archive_md_path"] = exc.archive_md_path
+                    err_item["archive_html_path"] = exc.archive_html_path
+                    if quarantine_path:
+                        err_item["quarantined_curated_path"] = quarantine_path
+                errors.append(err_item)
 
         fts_enabled = rebuild_fts(conn)
 
@@ -1233,11 +1748,11 @@ def cmd_status(cfg: Config, conn: sqlite3.Connection) -> dict[str, Any]:
 def cmd_list(conn: sqlite3.Connection, category: str | None, limit: int) -> dict[str, Any]:
     q = (
         "SELECT tweet_id, title, url, category, post_time, path, quality_score, ingested_at "
-        "FROM entries"
+        "FROM entries WHERE COALESCE(capture_status, 'ok') = 'ok'"
     )
     params: list[Any] = []
     if category:
-        q += " WHERE category = ?"
+        q += " AND category = ?"
         params.append(category)
     q += " ORDER BY ingested_at DESC LIMIT ?"
     params.append(limit)
@@ -1266,7 +1781,7 @@ def cmd_search(conn: sqlite3.Connection, query: str, limit: int) -> dict[str, An
                    e.quality_score, bm25(entries_fts) AS score
             FROM entries_fts
             JOIN entries e ON e.rowid = entries_fts.rowid
-            WHERE entries_fts MATCH ?
+            WHERE entries_fts MATCH ? AND COALESCE(e.capture_status, 'ok') = 'ok'
             ORDER BY score
             LIMIT ?
             """,
@@ -1291,7 +1806,7 @@ def cmd_search(conn: sqlite3.Connection, query: str, limit: int) -> dict[str, An
         """
         SELECT tweet_id, title, url, category, post_time, path, quality_score
         FROM entries
-        WHERE title LIKE ? OR text LIKE ?
+        WHERE (title LIKE ? OR text LIKE ?) AND COALESCE(capture_status, 'ok') = 'ok'
         ORDER BY ingested_at DESC
         LIMIT ?
         """,

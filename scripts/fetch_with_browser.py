@@ -1,7 +1,14 @@
 #!/usr/bin/env python3
-"""Browser-rendered page text fetcher (for KB fallback).
+"""Browser-rendered page snapshot fetcher (for KB fallback).
 
-Output JSON: {"title": "...", "text": "...", "source": "browser-playwright"}
+Output JSON:
+{
+  "title": "...",
+  "text": "...",
+  "html": "...",
+  "media": [{"url":"...", "alt":"...", "source":"browser-image"}],
+  "source": "browser-playwright"
+}
 """
 
 from __future__ import annotations
@@ -42,7 +49,41 @@ def main() -> int:
             title = (page.title() or "").strip()
             text = page.locator("body").inner_text(timeout=5000)
             text = " ".join(text.split())[:16000]
-            print(json.dumps({"title": title[:120], "text": text, "source": "browser-playwright"}, ensure_ascii=False))
+            html = page.content()
+            html = (html or "")[:600000]
+            media = page.evaluate(
+                """
+                () => {
+                  const out = [];
+                  const seen = new Set();
+                  const nodes = Array.from(document.querySelectorAll('img'));
+                  for (const img of nodes) {
+                    const src = (img.currentSrc || img.src || '').trim();
+                    if (!src || seen.has(src)) continue;
+                    seen.add(src);
+                    out.push({
+                      url: src,
+                      alt: (img.alt || '').trim(),
+                      source: 'browser-image'
+                    });
+                    if (out.length >= 20) break;
+                  }
+                  return out;
+                }
+                """
+            )
+            print(
+                json.dumps(
+                    {
+                        "title": title[:120],
+                        "text": text,
+                        "html": html,
+                        "media": media,
+                        "source": "browser-playwright",
+                    },
+                    ensure_ascii=False,
+                )
+            )
             return 0
         finally:
             context.close()
