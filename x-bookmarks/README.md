@@ -8,7 +8,7 @@
 - `curated/`: 已整理的 Markdown 知识内容（按分类/日期）
 - `index/`: 本地检索索引（SQLite）
 - `meta/`: 运行摘要与维护元数据
-- `archive/`: 历史结构与迁移归档（不参与主流程）
+- `archive/`: 历史结构与迁移归档（含 `quarantine/` 隔离样本）
 
 ## 使用说明
 
