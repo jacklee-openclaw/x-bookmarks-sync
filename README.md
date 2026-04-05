@@ -6,6 +6,8 @@
 
 当前主入口：`python3 x_links_to_kb.py`
 
+详细操作与排障手册：`docs/USER_MANUAL.md`
+
 ## 1. 核心原则
 
 - 原文归档优先：每条任务先落原文归档，再决定是否生成 curated。
