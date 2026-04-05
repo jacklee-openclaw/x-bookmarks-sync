@@ -19,3 +19,7 @@ python3 /Users/paipai_1/Work/projects/x_to_cdns/x_links_to_kb.py sync --text 'ht
 - `.state/runs/*.json`
 - `meta/run-log.jsonl`
 - `archive/quarantine/`
+
+说明：
+- `archive/quarantine/degraded-curated/`：被门禁判定为退化后隔离的旧卡片
+- `archive/quarantine/orphan-curated/`：未被当前索引引用的历史卡片归档
