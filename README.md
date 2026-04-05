@@ -51,7 +51,7 @@ x_to_cdns/
 若抓取退化（degraded capture）：
 - 仍会保存 raw 原文归档（用于追溯）
 - 不生成正常 curated
-- 任务进入 `error`（或配置下的 `retry`）
+- 任务进入 `error`
 - run log 写入失败原因与归档路径
 
 ## 4. 质量门禁（关键）
@@ -83,11 +83,14 @@ cp .env.example .env
 - `KB_STATE_ROOT=.state`
 - `KB_CATEGORIES_CONFIG=config/categories.json`
 - `KB_TEMPLATE_DIR=templates`
+- `KB_SYNC_LIMIT=30`（供 `scripts/openclaw_sync.sh`）
 - `KB_CONTENT_MIN_LEN=120`
 - `KB_MIN_ACCEPT_SCORE=70`
 - `KB_DOWNLOAD_MEDIA=1`
 - `KB_MAX_MEDIA_DOWNLOAD=4`
 - `KB_AUTO_GIT_PUSH=1`
+- `KB_GIT_REMOTE=origin`
+- `KB_GIT_BRANCH=main`
 
 ## 6. 常用命令
 
@@ -97,6 +100,11 @@ cp .env.example .env
 python3 x_links_to_kb.py path
 python3 x_links_to_kb.py status
 ```
+
+`status` 输出重点字段：
+- `entries_total`: 索引总条目数
+- `entries_ok`: 门禁通过且可检索条目
+- `entries_degraded`: 退化条目数量
 
 ### 6.2 同步一条链接
 
@@ -148,6 +156,7 @@ python3 x_links_to_kb.py sync \
 说明：
 - 若仍 degraded，会保留 raw 原文归档证据并进入 `error`。
 - 若历史上已有错误 curated，系统会移动到 `x-bookmarks/archive/quarantine/degraded-curated/...`。
+- 若发现历史“无索引映射”的旧卡片，会移动到 `x-bookmarks/archive/quarantine/orphan-curated/...`。
 
 ## 9. OpenClaw/Telegram 接入
 

@@ -61,3 +61,8 @@ Search/List queries filter by `capture_status` to avoid indexing degraded pages.
 
 Default git scope is `x-bookmarks/`.
 State directory is excluded unless `KB_GIT_INCLUDE_STATE=1`.
+
+## 8. Quarantine Contract
+
+- degraded curated outputs are archived under `x-bookmarks/archive/quarantine/degraded-curated/`
+- curated markdown files not referenced by current `entries.path` are archived under `x-bookmarks/archive/quarantine/orphan-curated/`

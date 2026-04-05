@@ -759,7 +759,7 @@ def evaluate_capture_quality(
         reasons.append("missing_post_time")
 
     score = quality_score(text, source_mode, cfg.content_min_len, marker_count=len(hits))
-    degraded = bool(hits) or score < cfg.min_accept_score
+    degraded = bool(reasons) or score < cfg.min_accept_score
     return {
         "score": score,
         "degraded": degraded,
@@ -1653,8 +1653,6 @@ def sync_queue(
 
         fts_enabled = rebuild_fts(conn)
 
-        git_result = maybe_git_push(cfg, no_git=no_git)
-
         finished = utc_now_iso()
         result = {
             "ok": len(errors) == 0,
@@ -1666,9 +1664,13 @@ def sync_queue(
             "processed": processed,
             "errors": errors,
             "fts": "enabled" if fts_enabled else "unavailable",
-            "git": git_result,
+            # Will be updated in returned payload after git. Persisted run log keeps pre-git snapshot.
+            "git": {"status": "pre_git"},
         }
         run_file = write_run_log(cfg, result)
+
+        git_result = maybe_git_push(cfg, no_git=no_git)
+        result["git"] = git_result
         result["run_log"] = str(run_file)
         return result
     finally:
@@ -1717,9 +1719,19 @@ def count_state_files(cfg: Config) -> dict[str, int]:
 
 def cmd_status(cfg: Config, conn: sqlite3.Connection) -> dict[str, Any]:
     queue_counts = count_state_files(cfg)
-    db_counts = conn.execute("SELECT COUNT(*) FROM entries").fetchone()[0]
+    total_entries = conn.execute("SELECT COUNT(*) FROM entries").fetchone()[0]
+    ok_entries = conn.execute(
+        "SELECT COUNT(*) FROM entries WHERE COALESCE(capture_status, 'ok') = 'ok'"
+    ).fetchone()[0]
+    degraded_entries = total_entries - ok_entries
     by_cat_rows = conn.execute(
-        "SELECT category, COUNT(*) c FROM entries GROUP BY category ORDER BY c DESC"
+        """
+        SELECT category, COUNT(*) c
+        FROM entries
+        WHERE COALESCE(capture_status, 'ok') = 'ok'
+        GROUP BY category
+        ORDER BY c DESC
+        """
     ).fetchall()
     by_cat = {str(k): int(v) for k, v in by_cat_rows}
 
@@ -1732,7 +1744,10 @@ def cmd_status(cfg: Config, conn: sqlite3.Connection) -> dict[str, Any]:
         "action": "status",
         "paths": cmd_path(cfg, None),
         "queue": queue_counts,
-        "entries": int(db_counts),
+        "entries": int(ok_entries),
+        "entries_total": int(total_entries),
+        "entries_ok": int(ok_entries),
+        "entries_degraded": int(degraded_entries),
         "categories": by_cat,
         "latest_run": {
             "run_id": latest_run.get("run_id"),
